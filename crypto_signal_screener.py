@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-急騰シグナル・スクリーニング + バックテスト + 通知 (v2)
+急騰シグナル・スクリーニング + バックテスト + 実績追跡 + 通知 (v3)
 =====================================================
 GitHub Actions などのスケジューラ上で定期実行される想定のスクリプトです。
 
@@ -9,15 +9,20 @@ GitHub Actions などのスケジューラ上で定期実行される想定の�
   1. 対象銘柄の価格・出来高データを取得
   2. 4つのシグナル（出来高急増／ボラティリティ収縮／ゴールデンクロス／RSI反発）を
      過去の全期間にわたって計算（未来のデータを見ない = ルックアヘッドバイアスなし）
-  3. バックテスト: 「シグナルが N 個重なった時、その後 HORIZON_BARS 本後に
-     何%動いたか」を過去データ全体で集計し、精度の目安を出す
-  4. 直近バーでシグナルが ALERT_MIN_SCORE 個以上重なっている銘柄を検出し、
+  3. バックテスト: 直近取得データ全体で「シグナルがN個重なった時、
+     その後 HORIZON_BARS 本後に何%動いたか」を集計（参考値）
+  4. 実績追跡（新機能）:
+     - シグナルが新規発生した銘柄を alerts_log.csv に記録
+     - 記録から HORIZON_BARS 本経過したものは、実際の値動きを検証して
+       的中/不的中・リターンを書き戻す
+     - こうして「本当に検出→通知したシグナル」の的中率が回を追うごとに
+       蓄積されていく（synthetic backtestより信頼できる実績データ）
+  5. 直近バーでシグナルが ALERT_MIN_SCORE 個以上重なっている銘柄のうち、
      前回まで検出されていなかった「新規」のものだけ ntfy.sh 経由で通知
-  5. 状態（前回のアラート銘柄）を alert_state.json に保存し、次回実行時に比較
 
 ★ 重要な注意
-- バックテストはあくまで過去データ上の集計であり、将来の的中を保証しません。
-- ダマシ（フェイクシグナル）は多く発生します。
+- バックテスト・実績追跡はいずれも過去データ上の集計であり、将来の的中を
+  保証しません。ダマシ（フェイクシグナル）は多く発生します。
 - 投資判断・資金管理はご自身の責任で行ってください。本スクリプトおよび
   作成者は投資助言を行うものではありません。
 """
@@ -50,6 +55,7 @@ SYMBOLS = [
 
 INTERVAL = "1h"            # ローソク足の間隔
 LOOKBACK_BARS = 500         # 取得本数（Binanceの上限は1000）
+INTERVAL_HOURS = {"1h": 1, "4h": 4, "1d": 24}.get(INTERVAL, 1)
 
 # --- シグナル判定パラメータ ---
 VOLUME_SPIKE_MULT = 2.5
@@ -64,7 +70,7 @@ RSI_WINDOW = 14
 RSI_OVERSOLD = 35
 RSI_LOOKBACK = 3
 
-# --- バックテスト設定 ---
+# --- バックテスト / 実績検証 設定 ---
 HORIZON_BARS = 24            # シグナル発生から何本先の値動きを見るか（1h足なら24=約1日後）
 SUCCESS_THRESHOLD_PCT = 3.0  # この%以上の上昇を「的中」とみなす
 
@@ -76,6 +82,15 @@ NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 STATE_FILE = "alert_state.json"
 RESULT_CSV = "signals_result.csv"
 BACKTEST_CSV = "backtest_report.csv"
+ALERTS_LOG_CSV = "alerts_log.csv"
+ACCURACY_CSV = "accuracy_report.csv"
+
+ALERTS_LOG_COLUMNS = [
+    "id", "symbol", "signal_at_utc", "score",
+    "volume_spike", "bb_squeeze", "golden_cross", "rsi_rebound",
+    "price_at_signal", "resolve_at_utc",
+    "resolved", "resolved_at_utc", "price_resolved", "outcome_pct", "hit",
+]
 
 BASE_URL = "https://api.binance.com"
 
@@ -108,13 +123,11 @@ def compute_signal_series(df: pd.DataFrame) -> pd.DataFrame:
     close = df["close"]
     volume = df["volume"]
 
-    # 1. 出来高スパイク（直近を除いた過去平均と比較）
     vol_avg = volume.rolling(VOLUME_AVG_WINDOW).mean()
     vol_avg_prev = vol_avg.shift(1)
     volume_spike = volume >= (vol_avg_prev * VOLUME_SPIKE_MULT)
     volume_ratio = volume / vol_avg_prev
 
-    # 2. ボリンジャーバンド収縮（過去 BB_SQUEEZE_WINDOW 本の中での下位%）
     ma = close.rolling(BB_WINDOW).mean()
     std = close.rolling(BB_WINDOW).std()
     upper = ma + BB_STD * std
@@ -123,13 +136,11 @@ def compute_signal_series(df: pd.DataFrame) -> pd.DataFrame:
     bw_threshold = bandwidth.rolling(BB_SQUEEZE_WINDOW, min_periods=60).quantile(BB_SQUEEZE_PERCENTILE)
     bb_squeeze = bandwidth <= bw_threshold
 
-    # 3. ゴールデンクロス（直近バーで発生）
     ma_short = close.rolling(MA_SHORT).mean()
     ma_long = close.rolling(MA_LONG).mean()
     diff = ma_short - ma_long
     golden_cross = (diff.shift(1) <= 0) & (diff > 0)
 
-    # 4. RSI 反発
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -166,11 +177,10 @@ def compute_signal_series(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# バックテスト
+# バックテスト（直近取得データでの参考集計）
 # ============================================================
 
 def backtest_rows(sig: pd.DataFrame) -> list:
-    """score>=1 だった各バーについて、HORIZON_BARS 本先までの値動き(%)を記録"""
     n = len(sig)
     if n <= HORIZON_BARS:
         return []
@@ -185,8 +195,7 @@ def backtest_rows(sig: pd.DataFrame) -> list:
         c1 = close[i + HORIZON_BARS]
         if c0 <= 0:
             continue
-        fwd_ret = (c1 - c0) / c0 * 100
-        rows.append((int(s), fwd_ret))
+        rows.append((int(s), (c1 - c0) / c0 * 100))
     return rows
 
 
@@ -208,23 +217,150 @@ def aggregate_backtest(all_rows: list) -> pd.DataFrame:
 
 
 # ============================================================
-# 通知（ntfy.sh）
+# 実績追跡（実際に検出したシグナルの記録と後日検証）
 # ============================================================
 
-def load_state() -> set:
+def load_alerts_log() -> pd.DataFrame:
+    if os.path.exists(ALERTS_LOG_CSV):
+        try:
+            df = pd.read_csv(ALERTS_LOG_CSV)
+            for col in ["resolved", "hit", "volume_spike", "bb_squeeze", "golden_cross", "rsi_rebound"]:
+                if col in df.columns:
+                    df[col] = df[col].map(
+                        lambda v: True if str(v) == "True" else (False if str(v) == "False" else v)
+                    )
+            for col in ALERTS_LOG_COLUMNS:
+                if col not in df.columns:
+                    df[col] = None
+            return df[ALERTS_LOG_COLUMNS]
+        except Exception as e:
+            print(f"alerts_log.csv の読み込みに失敗: {e}")
+    return pd.DataFrame(columns=ALERTS_LOG_COLUMNS)
+
+
+def save_alerts_log(df: pd.DataFrame):
+    df.to_csv(ALERTS_LOG_CSV, index=False, encoding="utf-8-sig")
+
+
+def append_alert_log(log: pd.DataFrame, symbol: str, signal_time, row: dict) -> pd.DataFrame:
+    entry_id = f"{symbol}-{int(pd.Timestamp(signal_time).timestamp())}"
+    if len(log) and (log["id"] == entry_id).any():
+        return log
+    resolve_at = pd.Timestamp(signal_time) + pd.Timedelta(hours=INTERVAL_HOURS * HORIZON_BARS)
+    new_row = {
+        "id": entry_id,
+        "symbol": symbol,
+        "signal_at_utc": str(signal_time),
+        "score": row["score"],
+        "volume_spike": row["volume_spike"],
+        "bb_squeeze": row["bb_squeeze"],
+        "golden_cross": row["golden_cross"],
+        "rsi_rebound": row["rsi_rebound"],
+        "price_at_signal": row["price"],
+        "resolve_at_utc": str(resolve_at),
+        "resolved": False,
+        "resolved_at_utc": None,
+        "price_resolved": None,
+        "outcome_pct": None,
+        "hit": None,
+    }
+    return pd.concat([log, pd.DataFrame([new_row])], ignore_index=True)
+
+
+def resolve_alerts_for_symbol(log: pd.DataFrame, symbol: str, price_df: pd.DataFrame) -> pd.DataFrame:
+    if len(log) == 0:
+        return log
+    mask = (log["symbol"] == symbol) & (log["resolved"] != True)  # noqa: E712
+    if not mask.any():
+        return log
+    times = pd.to_datetime(price_df["open_time"], utc=True).reset_index(drop=True)
+    closes = price_df["close"].reset_index(drop=True)
+    for idx in log[mask].index:
+        try:
+            resolve_at = pd.Timestamp(log.at[idx, "resolve_at_utc"])
+            if resolve_at.tzinfo is None:
+                resolve_at = resolve_at.tz_localize("UTC")
+        except Exception:
+            continue
+        candidates = times[times >= resolve_at]
+        if len(candidates) == 0:
+            continue  # まだその時刻に到達していない
+        pos = candidates.index[0]
+        price_resolved = float(closes.loc[pos])
+        price_at_signal = float(log.at[idx, "price_at_signal"])
+        if price_at_signal <= 0:
+            continue
+        outcome_pct = round((price_resolved - price_at_signal) / price_at_signal * 100, 2)
+        log.at[idx, "resolved"] = True
+        log.at[idx, "resolved_at_utc"] = str(times.loc[pos])
+        log.at[idx, "price_resolved"] = price_resolved
+        log.at[idx, "outcome_pct"] = outcome_pct
+        log.at[idx, "hit"] = outcome_pct >= SUCCESS_THRESHOLD_PCT
+    return log
+
+
+def print_accuracy_report(log: pd.DataFrame):
+    print("\n" + "=" * 70)
+    print("■ 実績追跡（実際に検出したシグナルのその後・蓄積データ）")
+    print("=" * 70)
+    if len(log) == 0:
+        print("まだ記録がありません。")
+        return
+    resolved = log[log["resolved"] == True].copy()  # noqa: E712
+    pending = log[log["resolved"] != True]  # noqa: E712
+    print(f"記録件数: {len(log)}（検証済み {len(resolved)} / 検証待ち {len(pending)}）")
+    if len(resolved) == 0:
+        print("検証済みデータがまだありません（シグナル発生からHORIZON_BARS本経過すると検証されます）。")
+        return
+    resolved["outcome_pct"] = resolved["outcome_pct"].astype(float)
+    rows = []
+    for lvl in sorted(resolved["score"].unique()):
+        sub = resolved[resolved["score"] == lvl]
+        win_rate = (sub["hit"] == True).mean() * 100  # noqa: E712
+        rows.append({
+            "score": lvl,
+            "n": len(sub),
+            "win_rate_pct": round(win_rate, 1),
+            "mean_return_pct": round(sub["outcome_pct"].mean(), 2),
+        })
+        print(f"  score={lvl}: n={len(sub):>3}  的中率={win_rate:5.1f}%  平均リターン={sub['outcome_pct'].mean():6.2f}%")
+    overall_win = (resolved["hit"] == True).mean() * 100  # noqa: E712
+    print(f"全体的中率: {overall_win:.1f}% (n={len(resolved)})")
+    pd.DataFrame(rows).to_csv(ACCURACY_CSV, index=False, encoding="utf-8-sig")
+
+
+# ============================================================
+# 状態（通知済み・記録済みの銘柄セット）
+# ============================================================
+
+def load_state() -> dict:
+    default = {"notify_active": [], "log_active": []}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                data = json.load(f)
+            if isinstance(data, list):  # 旧バージョンとの互換
+                return {"notify_active": data, "log_active": []}
+            return {
+                "notify_active": data.get("notify_active", []),
+                "log_active": data.get("log_active", []),
+            }
         except Exception:
-            return set()
-    return set()
+            return default
+    return default
 
 
-def save_state(symbols: set):
+def save_state(notify_active: set, log_active: set):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(symbols), f, ensure_ascii=False)
+        json.dump({
+            "notify_active": sorted(notify_active),
+            "log_active": sorted(log_active),
+        }, f, ensure_ascii=False)
 
+
+# ============================================================
+# 通知（ntfy.sh）
+# ============================================================
 
 def send_notification(new_alerts: set, latest_rows: dict):
     if not NTFY_TOPIC:
@@ -260,8 +396,16 @@ def main():
     print(f"対象銘柄: {len(SYMBOLS)} / 足種: {INTERVAL} / 取得本数: {LOOKBACK_BARS}")
     print("-" * 70)
 
+    prev_state = load_state()
+    prev_notify_active = set(prev_state["notify_active"])
+    prev_log_active = set(prev_state["log_active"])
+
+    alerts_log = load_alerts_log()
+
     latest_rows = {}
     all_backtest_rows = []
+    new_notify_active = set()
+    new_log_active = set()
 
     for i, symbol in enumerate(SYMBOLS, 1):
         try:
@@ -272,11 +416,8 @@ def main():
                 continue
 
             sig = compute_signal_series(df)
-
-            # --- バックテスト用データ収集 ---
             all_backtest_rows.extend(backtest_rows(sig))
 
-            # --- 直近バーの状態 ---
             last = sig.iloc[-1]
             price = float(df["close"].iloc[-1])
             bars_24h = 24 if INTERVAL == "1h" else 1
@@ -286,7 +427,7 @@ def main():
                 if past_price > 0:
                     pct24 = round((price - past_price) / past_price * 100, 2)
 
-            latest_rows[symbol] = {
+            row = {
                 "score": int(last["score"]),
                 "price": price,
                 "pct_change_24h_bars": pct24,
@@ -298,18 +439,35 @@ def main():
                 "rsi": round(float(last["rsi"]), 1) if pd.notna(last["rsi"]) else None,
                 "rsi_rebound": bool(last["rsi_rebound"]),
             }
-            print(f"[{i}/{len(SYMBOLS)}] {symbol:12s} score={latest_rows[symbol]['score']}")
+            latest_rows[symbol] = row
+
+            if row["score"] >= 1:
+                new_log_active.add(symbol)
+            if row["score"] >= ALERT_MIN_SCORE:
+                new_notify_active.add(symbol)
+
+            # 新規にシグナルが立った瞬間だけ記録（同じ状態が続く間は再記録しない）
+            if symbol in new_log_active and symbol not in prev_log_active:
+                signal_time = df["open_time"].iloc[-1]
+                alerts_log = append_alert_log(alerts_log, symbol, signal_time, row)
+
+            # この銘柄について、検証待ちのものがあれば結果を書き戻す
+            alerts_log = resolve_alerts_for_symbol(alerts_log, symbol, df)
+
+            print(f"[{i}/{len(SYMBOLS)}] {symbol:12s} score={row['score']}")
         except Exception as e:
             print(f"[{i}/{len(SYMBOLS)}] {symbol}: エラー ({e})")
         time.sleep(0.15)
+
+    save_alerts_log(alerts_log)
 
     if not latest_rows:
         print("結果がありません。処理を終了します。")
         return
 
-    # --- バックテストレポート ---
+    # --- バックテストレポート（参考値） ---
     print("\n" + "=" * 70)
-    print(f"■ バックテスト結果（{HORIZON_BARS}本先までの値動き / {SUCCESS_THRESHOLD_PCT}%以上上昇を的中とみなす）")
+    print(f"■ バックテスト（直近データの参考値 / {HORIZON_BARS}本先 / {SUCCESS_THRESHOLD_PCT}%以上上昇を的中とみなす）")
     print("=" * 70)
     bt = aggregate_backtest(all_backtest_rows)
     if len(bt):
@@ -319,6 +477,9 @@ def main():
         bt.to_csv(BACKTEST_CSV, mode="a", header=header_needed, index=False, encoding="utf-8-sig")
     else:
         print("バックテスト対象データが不足しています。")
+
+    # --- 実績追跡レポート（本命） ---
+    print_accuracy_report(alerts_log)
 
     # --- 直近スクリーニング結果 ---
     df_res = pd.DataFrame([{"symbol": s, **v} for s, v in latest_rows.items()])
@@ -332,18 +493,17 @@ def main():
         print(df_res.to_string(index=False))
 
     # --- 通知判定 ---
-    current_alerts = {s for s, v in latest_rows.items() if v["score"] >= ALERT_MIN_SCORE}
-    prev_alerts = load_state()
-    new_alerts = current_alerts - prev_alerts
-    if new_alerts:
-        print(f"\n新規アラート: {', '.join(sorted(new_alerts))}")
-        send_notification(new_alerts, latest_rows)
+    truly_new_notify = new_notify_active - prev_notify_active
+    if truly_new_notify:
+        print(f"\n新規アラート: {', '.join(sorted(truly_new_notify))}")
+        send_notification(truly_new_notify, latest_rows)
     else:
         print("\n新規アラートなし（既に通知済み、または該当なし）")
-    save_state(current_alerts)
+
+    save_state(new_notify_active, new_log_active)
 
     print(f"\n結果を {RESULT_CSV} に保存しました。")
-    print("※ 過去パターンとの一致を示すものであり、将来の値動きを保証するものではありません。")
+    print("※ 過去パターンとの一致・過去の実績を示すものであり、将来の値動きを保証するものではありません。")
 
 
 if __name__ == "__main__":
