@@ -28,7 +28,7 @@ jobs:
           ALERT_MIN_SCORE: "3"
         run: python crypto_signal_screener.py
 
-            - name: Commit updated state/results
+      - name: Commit updated state/results
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
@@ -44,9 +44,3 @@ jobs:
           else
             echo "no files to commit"
           fi
-        run: |
-          git config user.name "signal-bot"
-          git config user.email "signal-bot@users.noreply.github.com"
-          git add alert_state.json signals_result.csv backtest_report.csv alerts_log.csv accuracy_report.csv
-          git diff --staged --quiet || git commit -m "update signal state [skip ci]"
-          git push
