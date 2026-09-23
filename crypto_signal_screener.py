@@ -92,7 +92,7 @@ ALERTS_LOG_COLUMNS = [
     "resolved", "resolved_at_utc", "price_resolved", "outcome_pct", "hit",
 ]
 
-BASE_URL = "https://api.binance.com"
+BASE_URL = "https://data-api.binance.vision" 
 
 
 # ============================================================
