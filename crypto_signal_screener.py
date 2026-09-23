@@ -84,6 +84,7 @@ RESULT_CSV = "signals_result.csv"
 BACKTEST_CSV = "backtest_report.csv"
 ALERTS_LOG_CSV = "alerts_log.csv"
 ACCURACY_CSV = "accuracy_report.csv"
+SIGNAL_ACCURACY_CSV = "signal_accuracy.csv"
 
 ALERTS_LOG_COLUMNS = [
     "id", "symbol", "signal_at_utc", "score",
@@ -92,7 +93,7 @@ ALERTS_LOG_COLUMNS = [
     "resolved", "resolved_at_utc", "price_resolved", "outcome_pct", "hit",
 ]
 
-BASE_URL = "https://data-api.binance.vision" 
+BASE_URL = "https://data-api.binance.vision"
 
 
 # ============================================================
@@ -327,6 +328,51 @@ def print_accuracy_report(log: pd.DataFrame):
     overall_win = (resolved["hit"] == True).mean() * 100  # noqa: E712
     print(f"全体的中率: {overall_win:.1f}% (n={len(resolved)})")
     pd.DataFrame(rows).to_csv(ACCURACY_CSV, index=False, encoding="utf-8-sig")
+
+    print_signal_accuracy_report(resolved)
+
+
+SIGNAL_LABELS = {
+    "volume_spike": "出来高急増",
+    "bb_squeeze": "ボラティリティ収縮",
+    "golden_cross": "ゴールデンクロス",
+    "rsi_rebound": "RSI反発",
+}
+
+
+def print_signal_accuracy_report(resolved: pd.DataFrame):
+    """シグナルの種類ごと（単体で該当していたかどうか）の的中率を集計する。
+    他のシグナルと重複していても構わず「そのシグナルが該当していた場合」で集計するため、
+    複数シグナルの合算である score 別レポートより、個々のシグナルの効き目が分かりやすい。
+    """
+    print("\n" + "=" * 70)
+    print("■ シグナル種類別の的中率（そのシグナルが該当していた場合）")
+    print("=" * 70)
+    if len(resolved) == 0:
+        return
+    rows = []
+    for col, label in SIGNAL_LABELS.items():
+        if col not in resolved.columns:
+            continue
+        sub = resolved[resolved[col] == True]  # noqa: E712
+        if len(sub) == 0:
+            rows.append({
+                "signal": col, "label": label, "n": 0,
+                "win_rate_pct": None, "mean_return_pct": None,
+            })
+            print(f"  {label:12s}: n=  0  (該当データなし)")
+            continue
+        win_rate = (sub["hit"] == True).mean() * 100  # noqa: E712
+        mean_ret = sub["outcome_pct"].mean()
+        rows.append({
+            "signal": col,
+            "label": label,
+            "n": len(sub),
+            "win_rate_pct": round(win_rate, 1),
+            "mean_return_pct": round(mean_ret, 2),
+        })
+        print(f"  {label:12s}: n={len(sub):>3}  的中率={win_rate:5.1f}%  平均リターン={mean_ret:6.2f}%")
+    pd.DataFrame(rows).to_csv(SIGNAL_ACCURACY_CSV, index=False, encoding="utf-8-sig")
 
 
 # ============================================================
