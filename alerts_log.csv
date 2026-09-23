@@ -1,0 +1,4 @@
+﻿id,symbol,signal_at_utc,score,volume_spike,bb_squeeze,golden_cross,rsi_rebound,price_at_signal,resolve_at_utc,resolved,resolved_at_utc,price_resolved,outcome_pct,hit
+SOLUSDT-1790179200,SOLUSDT,2026-09-23 16:00:00+00:00,1,False,False,False,True,114.59,2026-09-24 16:00:00+00:00,False,,,,
+AAVEUSDT-1790179200,AAVEUSDT,2026-09-23 16:00:00+00:00,1,False,False,False,True,139.87,2026-09-24 16:00:00+00:00,False,,,,
+MANAUSDT-1790179200,MANAUSDT,2026-09-23 16:00:00+00:00,1,False,False,False,True,0.0837,2026-09-24 16:00:00+00:00,False,,,,
