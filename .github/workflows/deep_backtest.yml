@@ -27,7 +27,7 @@ jobs:
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          files="deep_backtest_by_score.csv deep_backtest_by_signal.csv deep_backtest_coverage.csv deep_backtest_report.md"
+          files="deep_backtest_by_score.csv deep_backtest_by_signal.csv deep_backtest_by_combo.csv deep_backtest_coverage.csv deep_backtest_report.md"
           existing=""
           for f in $files; do
             if [ -f "$f" ]; then existing="$existing $f"; fi
