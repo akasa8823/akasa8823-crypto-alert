@@ -130,13 +130,12 @@ def backtest_rows_detailed(sig: pd.DataFrame, horizon_bars: int) -> list:
     rows = []
     for i in range(n - horizon_bars):
         s = score[i]
-        if s <= 0:
-            continue
         c0 = close[i]
         c1 = close[i + horizon_bars]
         if c0 <= 0:
             continue
         ret = (c1 - c0) / c0 * 100
+        # score==0（シグナル無し）の行も含める。これが「ベースライン」（比較対象）になる。
         rows.append((int(s), bool(vs[i]), bool(bb[i]), bool(gc[i]), bool(rr[i]), ret))
     return rows
 
@@ -170,15 +169,17 @@ def main():
             for r in rows:
                 all_rows.append((symbol,) + r)
 
+            signal_occurrences = sum(1 for r in rows if r[0] > 0)  # score>0 のみカウント
+
             date_from = df["open_time"].iloc[0]
             date_to = df["open_time"].iloc[-1]
             years = (date_to - date_from).days / 365.25
             coverage.append({
                 "symbol": symbol, "bars": len(df),
                 "date_from": str(date_from.date()), "date_to": str(date_to.date()),
-                "years": round(years, 2), "signal_occurrences": len(rows),
+                "years": round(years, 2), "signal_occurrences": signal_occurrences,
             })
-            print(f"[{i}/{len(SYMBOLS)}] {symbol:12s} {len(df):>5}本 ({years:5.2f}年分)  シグナル発生{len(rows):>4}回")
+            print(f"[{i}/{len(SYMBOLS)}] {symbol:12s} {len(df):>5}本 ({years:5.2f}年分)  シグナル発生{signal_occurrences:>4}回")
         except Exception as e:
             print(f"[{i}/{len(SYMBOLS)}] {symbol}: エラー ({e})")
         time.sleep(0.1)
@@ -194,6 +195,17 @@ def main():
     total_years_span = cov_df["years"].max() if len(cov_df) else 0
     total_bars = int(cov_df["bars"].sum()) if len(cov_df) else 0
 
+    # --- ベースライン（シグナル無し = score 0 の時の成績） ---
+    baseline_sub = df_all[df_all["score"] == 0]
+    if len(baseline_sub) > 0:
+        baseline_win_rate = (baseline_sub["ret"] >= SUCCESS_THRESHOLD_PCT).mean() * 100
+        baseline_mean = baseline_sub["ret"].mean()
+        baseline_median = baseline_sub["ret"].median()
+        baseline_n = len(baseline_sub)
+    else:
+        baseline_win_rate = baseline_mean = baseline_median = 0.0
+        baseline_n = 0
+
     # --- スコア別集計 ---
     by_score = []
     for lvl in sorted(df_all["score"].unique()):
@@ -205,6 +217,7 @@ def main():
             "win_rate_pct": round(win_rate, 1),
             "mean_return_pct": round(sub["ret"].mean(), 2),
             "median_return_pct": round(sub["ret"].median(), 2),
+            "edge_over_baseline_pct": round(win_rate - baseline_win_rate, 1),
         })
     by_score_df = pd.DataFrame(by_score).sort_values("score")
     by_score_df.to_csv(BY_SCORE_CSV, index=False, encoding="utf-8-sig")
@@ -214,7 +227,7 @@ def main():
     for col, label in SIGNAL_LABELS.items():
         sub = df_all[df_all[col] == True]  # noqa: E712
         if len(sub) == 0:
-            by_signal.append({"signal": col, "label": label, "n": 0, "win_rate_pct": None, "mean_return_pct": None, "median_return_pct": None})
+            by_signal.append({"signal": col, "label": label, "n": 0, "win_rate_pct": None, "mean_return_pct": None, "median_return_pct": None, "edge_over_baseline_pct": None})
             continue
         win_rate = (sub["ret"] >= SUCCESS_THRESHOLD_PCT).mean() * 100
         by_signal.append({
@@ -222,22 +235,26 @@ def main():
             "win_rate_pct": round(win_rate, 1),
             "mean_return_pct": round(sub["ret"].mean(), 2),
             "median_return_pct": round(sub["ret"].median(), 2),
+            "edge_over_baseline_pct": round(win_rate - baseline_win_rate, 1),
         })
     by_signal_df = pd.DataFrame(by_signal)
     by_signal_df.to_csv(BY_SIGNAL_CSV, index=False, encoding="utf-8-sig")
 
-    overall_win = (df_all["ret"] >= SUCCESS_THRESHOLD_PCT).mean() * 100
-    baseline_win = None  # ランダムな時点と比較するベースラインは別途注記
+    overall_sub = df_all[df_all["score"] > 0]
+    overall_win = (overall_sub["ret"] >= SUCCESS_THRESHOLD_PCT).mean() * 100 if len(overall_sub) else 0.0
 
     print("\n" + "=" * 70)
-    print("■ スコア別")
+    print(f"■ ベースライン（シグナル無し）: 的中率 {baseline_win_rate:.1f}% / 平均 {baseline_mean:.2f}% / 中央値 {baseline_median:.2f}% (n={baseline_n})")
+    print("=" * 70)
+    print("\n" + "=" * 70)
+    print("■ スコア別（edge_over_baseline_pct = ベースラインとの的中率の差）")
     print("=" * 70)
     print(by_score_df.to_string(index=False))
     print("\n" + "=" * 70)
     print("■ シグナル種類別（単体該当時）")
     print("=" * 70)
     print(by_signal_df.to_string(index=False))
-    print(f"\n全体的中率: {overall_win:.1f}% (n={len(df_all)})")
+    print(f"\n全体的中率（score>0の全ケース）: {overall_win:.1f}% (n={len(overall_sub)})  / ベースライン比 edge: {overall_win - baseline_win_rate:+.1f}pt")
 
     # --- Markdownレポート ---
     lines = []
@@ -250,23 +267,41 @@ def main():
     lines.append(f"- 最長データ期間: 約 {total_years_span:.1f} 年（銘柄により異なる。詳細は `{COVERAGE_CSV}`）")
     lines.append(f"- 取得した総本数: {total_bars:,} 本\n")
 
+    lines.append("## ベースライン（シグナルが一切無いときの成績）\n")
+    lines.append(
+        f"シグナルに意味があるかどうかは、**「シグナル無し」の成績と比べてどれだけ良いか**でしか判断できません。"
+        f"以下がその比較対象（ベースライン）です。\n"
+    )
+    lines.append(f"- ベースライン的中率: **{baseline_win_rate:.1f}%** / 平均リターン: {baseline_mean:.2f}% / 中央値: {baseline_median:.2f}% (n={baseline_n:,})\n")
+    lines.append(
+        "以下の表の `edge_over_baseline_pct` は「そのスコア／シグナルの的中率 − ベースライン的中率」です。"
+        "**プラスが大きいほど、シグナルに本当の優位性がある**ことを意味し、0前後や大差ない場合は"
+        "「シグナルがあってもなくても結果は変わらない」ことを意味します。\n"
+    )
+
     lines.append("## スコア別の成績（シグナルが何個重なっていたか）\n")
-    lines.append("| スコア | 発生回数 | 的中率 | 平均リターン | 中央値リターン |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| スコア | 発生回数 | 的中率 | ベースライン比(edge) | 平均リターン | 中央値リターン |")
+    lines.append("|---|---|---|---|---|---|")
     for _, r in by_score_df.iterrows():
-        lines.append(f"| {int(r['score'])} | {int(r['n'])} | {r['win_rate_pct']}% | {r['mean_return_pct']}% | {r['median_return_pct']}% |")
+        edge = r['edge_over_baseline_pct']
+        edge_str = f"{edge:+.1f}pt" if pd.notna(edge) else "-"
+        tag = "0（ベースライン）" if int(r['score']) == 0 else str(int(r['score']))
+        lines.append(f"| {tag} | {int(r['n'])} | {r['win_rate_pct']}% | {edge_str} | {r['mean_return_pct']}% | {r['median_return_pct']}% |")
 
     lines.append("\n## シグナル種類別の成績（そのシグナルが単体で該当していた場合）\n")
-    lines.append("| シグナル | 発生回数 | 的中率 | 平均リターン | 中央値リターン |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| シグナル | 発生回数 | 的中率 | ベースライン比(edge) | 平均リターン | 中央値リターン |")
+    lines.append("|---|---|---|---|---|---|")
     for _, r in by_signal_df.iterrows():
         n = int(r["n"])
         if n == 0:
-            lines.append(f"| {r['label']} | 0 | - | - | - |")
+            lines.append(f"| {r['label']} | 0 | - | - | - | - |")
         else:
-            lines.append(f"| {r['label']} | {n} | {r['win_rate_pct']}% | {r['mean_return_pct']}% | {r['median_return_pct']}% |")
+            edge = r['edge_over_baseline_pct']
+            edge_str = f"{edge:+.1f}pt" if pd.notna(edge) else "-"
+            lines.append(f"| {r['label']} | {n} | {r['win_rate_pct']}% | {edge_str} | {r['mean_return_pct']}% | {r['median_return_pct']}% |")
 
-    lines.append(f"\n**全体的中率: {overall_win:.1f}%**（n={len(df_all)}、いずれか1つ以上のシグナルが該当した全ケース）\n")
+    lines.append(f"\n**全体的中率（score>0の全ケース）: {overall_win:.1f}%**（n={len(overall_sub):,}）"
+                  f" / **ベースライン比 edge: {overall_win - baseline_win_rate:+.1f}pt**\n")
 
     lines.append("## 銘柄別のデータ取得状況\n")
     lines.append("| 銘柄 | 取得期間 | 年数 | シグナル発生回数 |")
