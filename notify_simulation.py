@@ -71,6 +71,14 @@ MAX_HOLD_BARS = int(MAX_HOLD_DAYS * 24)  # 1時間足なので1日=24本
 FEE_ROUNDTRIP_PCT = float(os.environ.get("SIM_FEE_ROUNDTRIP_PCT", "0.2"))  # 往復手数料の概算
 INITIAL_CAPITAL_JPY = float(os.environ.get("SIM_INITIAL_CAPITAL_JPY", "1000000"))
 
+# 1日あたり何件まで通知を絞り込むか（全30銘柄を合算したシステム全体での件数）。
+# 「確度の高さ」の指標として、シグナル成立時点で分かる volume_ratio（出来高が平均の何倍か）
+# を使う。未来の結果（リターン）でランキングすると答え合わせ後の情報を使うことになり
+# バックテストとして不正確になるため、あくまで「シグナル発生時点で観測できる値」のみを使う。
+SIM_MAX_SIGNALS_PER_DAY = int(os.environ.get("SIM_MAX_SIGNALS_PER_DAY", "2"))
+# 1回のエントリーに、その時点の残高の何％を投資するか（複利）
+SIM_ENTRY_FRACTION = float(os.environ.get("SIM_ENTRY_FRACTION", "0.30"))
+
 YEARS_TO_REPORT = [2023, 2024]
 
 BASE_URL = core.BASE_URL
@@ -119,6 +127,44 @@ def fetch_klines_forward(symbol: str, interval: str, start_ms: int, page_limit: 
 
 
 # ============================================================
+# 日次フィルタ（確度の高い通知だけに絞り込む） & 複利シミュレーション
+# ============================================================
+
+def filter_top_signals_per_day(trades_df: pd.DataFrame, max_per_day: int) -> pd.DataFrame:
+    """全銘柄を合算した「システム全体」で、1日あたり signal_volume_ratio が高い順に
+    上位 max_per_day 件だけを残す。未来のリターンは一切使わず、シグナル成立時点で
+    分かる出来高倍率だけでランキングする（先読みバイアスを避けるため）。"""
+    df = trades_df.copy()
+    df["entry_date"] = df["entry_time"].dt.date
+    df["_rank"] = df.groupby("entry_date")["signal_volume_ratio"].rank(method="first", ascending=False)
+    selected = df[df["_rank"] <= max_per_day].drop(columns=["_rank"])
+    return selected.sort_values("entry_time").reset_index(drop=True)
+
+
+def compound_simulate(trades_sorted: pd.DataFrame, initial_capital: float, fraction: float) -> dict:
+    """時系列順のトレードに対し、毎回「その時点の残高のfraction割合」を賭ける複利シミュレーション。
+    最大ドローダウン（ピーク残高からの最大下落率）も併せて計算する。"""
+    balance = initial_capital
+    peak = initial_capital
+    max_drawdown_pct = 0.0
+    balances = []
+    for _, row in trades_sorted.iterrows():
+        bet = balance * fraction
+        pnl = bet * row["net_return_pct"] / 100
+        balance += pnl
+        peak = max(peak, balance)
+        if peak > 0:
+            dd = (peak - balance) / peak * 100
+            max_drawdown_pct = max(max_drawdown_pct, dd)
+        balances.append(balance)
+    return {
+        "final_balance": balance,
+        "max_drawdown_pct": max_drawdown_pct,
+        "balances": balances,
+    }
+
+
+# ============================================================
 # エントリー検出 & 利確シミュレーション
 # ============================================================
 
@@ -132,6 +178,7 @@ def simulate_symbol(symbol: str, df: pd.DataFrame) -> list:
     vs = sig["volume_spike"].to_numpy()
     rr = sig["rsi_rebound"].to_numpy()
     entry_signal = vs & rr
+    volume_ratio = sig["volume_ratio"].to_numpy()
 
     open_time = df["open_time"].to_numpy()
     open_ = df["open"].to_numpy()
@@ -141,6 +188,8 @@ def simulate_symbol(symbol: str, df: pd.DataFrame) -> list:
     trades = []
     for i in range(1, n - 1):
         if entry_signal[i] and not entry_signal[i - 1]:
+            # シグナル成立時点（未来を見ない）での出来高倍率を「確度」の指標として記録する
+            sig_vol_ratio = float(volume_ratio[i]) if pd.notna(volume_ratio[i]) else 0.0
             entry_idx = i + 1  # 次の足の始値でエントリー（未来を見ない）
             if entry_idx >= n:
                 continue
@@ -179,6 +228,7 @@ def simulate_symbol(symbol: str, df: pd.DataFrame) -> list:
                 "resolved": resolved,  # True=+5%到達で利確 / False=期限切れで強制決済
                 "bars_held": bars_held,
                 "days_held": round(bars_held / 24, 2),
+                "signal_volume_ratio": round(sig_vol_ratio, 3),  # シグナル成立時点の出来高倍率（確度指標）
             })
     return trades
 
@@ -211,57 +261,83 @@ def main():
         return
 
     trades_df = pd.DataFrame(all_trades).sort_values("entry_time").reset_index(drop=True)
+
+    # 全銘柄合算で、1日あたり signal_volume_ratio（シグナル成立時点で分かる出来高倍率＝確度の代理指標）
+    # が高い順に上位 SIM_MAX_SIGNALS_PER_DAY 件だけに絞り込む
+    filtered_df = filter_top_signals_per_day(trades_df, SIM_MAX_SIGNALS_PER_DAY)
+    selected_keys = set(zip(filtered_df["symbol"], filtered_df["entry_time"]))
+    trades_df["selected"] = trades_df.apply(lambda r: (r["symbol"], r["entry_time"]) in selected_keys, axis=1)
     trades_df.to_csv(TRADES_CSV, index=False, encoding="utf-8-sig")
 
     lines = []
-    lines.append("# 通知回数 & 利確シミュレーションレポート\n")
+    lines.append("# 通知回数 & 利確シミュレーションレポート（確度フィルタ + 複利版）\n")
     lines.append(f"- 実行日時(UTC): {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"- 通知条件: 出来高急増 かつ RSI反発 が新たに成立した瞬間（エッジ検出）")
     lines.append(f"- 対象銘柄数: {len(SYMBOLS)} / 使用した足: {SIM_INTERVAL}（ライブ運用と同じ）")
     lines.append(f"- データ取得開始: {SIM_START_DATE}")
     lines.append(f"- 利確ライン: +{TAKE_PROFIT_PCT}%（到達しない場合は{MAX_HOLD_DAYS}日で強制決済）")
     lines.append(f"- 往復手数料の概算控除: {FEE_ROUNDTRIP_PCT}%")
-    lines.append(f"- シミュレーション元本: {INITIAL_CAPITAL_JPY:,.0f}円（年ごとに、その年の通知回数で均等分配）\n")
+    lines.append(f"- **確度フィルタ**: 全{len(SYMBOLS)}銘柄を合算し、1日あたりシグナル成立時点の出来高倍率\n"
+                 f"  （volume_ratio）が高い順に上位 **{SIM_MAX_SIGNALS_PER_DAY}件** のみを通知として採用")
+    lines.append(f"- **資金配分**: 1回のエントリーごとに、その時点の残高の **{SIM_ENTRY_FRACTION*100:.0f}%** を投資（複利）")
+    lines.append(f"- シミュレーション元本: {INITIAL_CAPITAL_JPY:,.0f}円\n")
 
     for year in YEARS_TO_REPORT:
-        year_trades = trades_df[trades_df["entry_time"].dt.year == year]
-        n_trades = len(year_trades)
+        year_all = trades_df[trades_df["entry_time"].dt.year == year]
+        year_filtered = filtered_df[filtered_df["entry_time"].dt.year == year].sort_values("entry_time").reset_index(drop=True)
+        n_all = len(year_all)
+        n_trades = len(year_filtered)
 
         lines.append(f"## {year}年の結果\n")
-        if n_trades == 0:
+        if n_all == 0:
             lines.append(f"{year}年は通知イベントがありませんでした。\n")
             print(f"\n■ {year}年: 通知0回")
             continue
 
-        n_resolved = int(year_trades["resolved"].sum())
+        lines.append(f"- フィルタ前の全通知回数（出来高急増+RSI反発が成立した全件）: {n_all}回")
+        if n_trades == 0:
+            lines.append(f"- フィルタ後（1日{SIM_MAX_SIGNALS_PER_DAY}件まで、確度が高い順）の採用件数: 0回\n")
+            print(f"\n■ {year}年: フィルタ後 通知0回")
+            continue
+
+        n_resolved = int(year_filtered["resolved"].sum())
         n_unresolved = n_trades - n_resolved
-        avg_days_resolved = year_trades.loc[year_trades["resolved"], "days_held"].mean() if n_resolved else float("nan")
-        avg_net_return = year_trades["net_return_pct"].mean()
-        win_rate = (year_trades["net_return_pct"] > 0).mean() * 100
+        avg_days_resolved = year_filtered.loc[year_filtered["resolved"], "days_held"].mean() if n_resolved else float("nan")
+        avg_net_return = year_filtered["net_return_pct"].mean()
+        win_rate = (year_filtered["net_return_pct"] > 0).mean() * 100
+        avg_per_day = n_trades / 365.0
 
-        position_size = INITIAL_CAPITAL_JPY / n_trades
-        year_trades = year_trades.copy()
-        year_trades["pnl_jpy"] = position_size * year_trades["net_return_pct"] / 100
-        total_pnl_jpy = year_trades["pnl_jpy"].sum()
-        final_balance_jpy = INITIAL_CAPITAL_JPY + total_pnl_jpy
+        sim = compound_simulate(year_filtered, INITIAL_CAPITAL_JPY, SIM_ENTRY_FRACTION)
+        final_balance = sim["final_balance"]
+        total_pnl = final_balance - INITIAL_CAPITAL_JPY
+        max_dd = sim["max_drawdown_pct"]
 
-        lines.append(f"- 通知回数: **{n_trades}回**")
+        lines.append(f"- フィルタ後（1日最大{SIM_MAX_SIGNALS_PER_DAY}件、確度が高い順）の通知回数: **{n_trades}回**"
+                     f"（1日あたり平均 約{avg_per_day:.2f}回）")
         lines.append(f"- うち+{TAKE_PROFIT_PCT}%に到達して利確: {n_resolved}回 / 期限切れで強制決済: {n_unresolved}回")
         if n_resolved:
             lines.append(f"- 利確までの平均日数（到達分のみ）: 約{avg_days_resolved:.1f}日")
         lines.append(f"- 1トレードあたりの平均リターン（手数料控除後）: {avg_net_return:+.2f}%")
         lines.append(f"- プラスで終わったトレードの割合: {win_rate:.1f}%")
-        lines.append(f"- 1トレードあたりの投資額（{INITIAL_CAPITAL_JPY:,.0f}円を{n_trades}回に均等分配）: 約{position_size:,.0f}円")
-        lines.append(f"- **シミュレーション結果: {INITIAL_CAPITAL_JPY:,.0f}円 → 約{final_balance_jpy:,.0f}円（損益 {total_pnl_jpy:+,.0f}円）**\n")
+        lines.append(f"- **複利シミュレーション結果（毎回残高の{SIM_ENTRY_FRACTION*100:.0f}%を投資、"
+                     f"{n_trades}回を時系列順に実行）:**")
+        lines.append(f"  - {INITIAL_CAPITAL_JPY:,.0f}円 → **約{final_balance:,.0f}円**（損益 {total_pnl:+,.0f}円）")
+        lines.append(f"  - **最大ドローダウン（残高のピークからの最大下落率）: -{max_dd:.1f}%**\n")
 
-        print(f"\n■ {year}年: 通知{n_trades}回 / 利確{n_resolved}回 / 強制決済{n_unresolved}回")
+        print(f"\n■ {year}年: 全通知{n_all}回 → フィルタ後{n_trades}回 / 利確{n_resolved}回 / 強制決済{n_unresolved}回")
         print(f"  平均リターン {avg_net_return:+.2f}% / 勝率 {win_rate:.1f}%")
-        print(f"  シミュレーション: {INITIAL_CAPITAL_JPY:,.0f}円 → {final_balance_jpy:,.0f}円 ({total_pnl_jpy:+,.0f}円)")
+        print(f"  複利シミュレーション: {INITIAL_CAPITAL_JPY:,.0f}円 → {final_balance:,.0f}円 ({total_pnl:+,.0f}円) / 最大DD -{max_dd:.1f}%")
 
     lines.append("## 注意事項\n")
     lines.append("- これは過去データを機械的に再現したシミュレーションであり、将来の成績を保証するものではありません。")
-    lines.append("- 資金は「その年の通知回数で均等分配し、全トレードに同時投資した」という単純化です。実際には通知が同時刻に重なることもあり、現実の資金管理とは異なります。")
-    lines.append("- 複利（利益を次のトレードに回す）は考慮していません。各年、常に元本100万円を使い切る前提です。")
+    lines.append(f"- 「確度」の指標には、シグナル成立時点で分かる出来高倍率（volume_ratio）を使っています。"
+                 f"未来のリターンでランキングすると答え合わせ後の情報を使うことになり不正確になるため、"
+                 f"あくまでシグナル発生時点で観測できる値のみで絞り込んでいます。")
+    lines.append(f"- 絞り込みは全{len(SYMBOLS)}銘柄を合算した「システム全体」で1日{SIM_MAX_SIGNALS_PER_DAY}件までとしており、"
+                 f"同じ日に複数銘柄で通知が重なる場合の資金制約（同時に必要な資金）までは考慮していません。")
+    lines.append(f"- 資金は複利（利益を次のトレードの元手に組み入れる）で計算していますが、"
+                 f"1回のエントリーで残高の{SIM_ENTRY_FRACTION*100:.0f}%を投じるため、"
+                 f"連敗が続くとドローダウンが大きくなるリスクがあります。上記の最大ドローダウンを必ずご確認ください。")
     lines.append(f"- 利確ラインに{MAX_HOLD_DAYS}日以内に到達しない場合、その時点の終値で強制決済したとみなしています。実際にはさらに長く保有する・損切りするなどの選択肢があります。")
     lines.append("- スリッページ（指値が想定通りに約定しない可能性）は考慮していません。")
     lines.append(f"- 手数料は往復{FEE_ROUNDTRIP_PCT}%の概算です。実際の手数料率はBinance Japanの契約プランをご確認ください。")
