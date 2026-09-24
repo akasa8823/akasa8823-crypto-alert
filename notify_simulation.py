@@ -58,7 +58,11 @@ import crypto_signal_screener as core
 # 設定
 # ============================================================
 
-SYMBOLS = core.SYMBOLS
+# BTCのみに限定したシミュレーション。
+# 注: このスクリプトは Binance の公開マーケットデータAPI（data-api.binance.vision）を
+# 使っており、扱えるのは USDT建てなどのペアのみで、BTC/JPY（Binance Japan固有の
+# 円建てペア）はこのAPIでは取得できません。そのため「BTC/USDT」のみで検証します。
+SYMBOLS = ["BTCUSDT"]
 SIM_INTERVAL = "1h"  # ライブ運用と同じ足
 
 SIM_START_DATE = os.environ.get("SIM_START_DATE", "2022-11-01")  # 指標のウォームアップ分を余裕を持って前倒し
@@ -77,7 +81,7 @@ INITIAL_CAPITAL_JPY = float(os.environ.get("SIM_INITIAL_CAPITAL_JPY", "1000000")
 # バックテストとして不正確になるため、あくまで「シグナル発生時点で観測できる値」のみを使う。
 SIM_MAX_SIGNALS_PER_DAY = int(os.environ.get("SIM_MAX_SIGNALS_PER_DAY", "2"))
 # 1回のエントリーに、その時点の残高の何％を投資するか（複利）
-SIM_ENTRY_FRACTION = float(os.environ.get("SIM_ENTRY_FRACTION", "0.30"))
+SIM_ENTRY_FRACTION = float(os.environ.get("SIM_ENTRY_FRACTION", "0.10"))
 
 YEARS_TO_REPORT = [2023, 2024]
 
