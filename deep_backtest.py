@@ -36,6 +36,7 @@ crypto_signal_screener.py が使っているのと全く同じシグナル定義
 import os
 import sys
 import time
+import itertools
 from datetime import datetime, timezone
 
 try:
@@ -66,8 +67,12 @@ SUCCESS_THRESHOLD_PCT = float(os.environ.get("DEEP_SUCCESS_THRESHOLD_PCT", str(c
 
 BY_SCORE_CSV = "deep_backtest_by_score.csv"
 BY_SIGNAL_CSV = "deep_backtest_by_signal.csv"
+BY_COMBO_CSV = "deep_backtest_by_combo.csv"
 COVERAGE_CSV = "deep_backtest_coverage.csv"
 REPORT_MD = "deep_backtest_report.md"
+
+# 組み合わせ集計で、この件数未満のものはノイズとして表から除外する
+MIN_COMBO_N = int(os.environ.get("DEEP_MIN_COMBO_N", "30"))
 
 BASE_URL = core.BASE_URL
 
@@ -240,6 +245,35 @@ def main():
     by_signal_df = pd.DataFrame(by_signal)
     by_signal_df.to_csv(BY_SIGNAL_CSV, index=False, encoding="utf-8-sig")
 
+    # --- シグナル組み合わせ別集計（該当シグナルをすべて満たす場合。他のシグナルの有無は問わない） ---
+    signal_cols = list(SIGNAL_LABELS.keys())
+    by_combo = []
+    for r in range(1, len(signal_cols) + 1):
+        for combo in itertools.combinations(signal_cols, r):
+            mask = pd.Series(True, index=df_all.index)
+            for c in combo:
+                mask &= df_all[c] == True  # noqa: E712
+            sub = df_all[mask]
+            n = len(sub)
+            if n < MIN_COMBO_N:
+                continue
+            win_rate = (sub["ret"] >= SUCCESS_THRESHOLD_PCT).mean() * 100
+            label = " + ".join(SIGNAL_LABELS[c] for c in combo)
+            by_combo.append({
+                "combo": "+".join(combo),
+                "label": label,
+                "n_signals": len(combo),
+                "n": n,
+                "win_rate_pct": round(win_rate, 1),
+                "mean_return_pct": round(sub["ret"].mean(), 2),
+                "median_return_pct": round(sub["ret"].median(), 2),
+                "edge_over_baseline_pct": round(win_rate - baseline_win_rate, 1),
+            })
+    by_combo_df = pd.DataFrame(by_combo)
+    if len(by_combo_df):
+        by_combo_df = by_combo_df.sort_values("edge_over_baseline_pct", ascending=False).reset_index(drop=True)
+    by_combo_df.to_csv(BY_COMBO_CSV, index=False, encoding="utf-8-sig")
+
     overall_sub = df_all[df_all["score"] > 0]
     overall_win = (overall_sub["ret"] >= SUCCESS_THRESHOLD_PCT).mean() * 100 if len(overall_sub) else 0.0
 
@@ -254,6 +288,13 @@ def main():
     print("■ シグナル種類別（単体該当時）")
     print("=" * 70)
     print(by_signal_df.to_string(index=False))
+    print("\n" + "=" * 70)
+    print(f"■ シグナル組み合わせ別（n>={MIN_COMBO_N}のみ、edge降順）")
+    print("=" * 70)
+    if len(by_combo_df):
+        print(by_combo_df[["label", "n", "win_rate_pct", "edge_over_baseline_pct", "mean_return_pct"]].to_string(index=False))
+    else:
+        print("（条件を満たす組み合わせがありませんでした）")
     print(f"\n全体的中率（score>0の全ケース）: {overall_win:.1f}% (n={len(overall_sub)})  / ベースライン比 edge: {overall_win - baseline_win_rate:+.1f}pt")
 
     # --- Markdownレポート ---
@@ -303,6 +344,25 @@ def main():
     lines.append(f"\n**全体的中率（score>0の全ケース）: {overall_win:.1f}%**（n={len(overall_sub):,}）"
                   f" / **ベースライン比 edge: {overall_win - baseline_win_rate:+.1f}pt**\n")
 
+    lines.append("## シグナルの組み合わせ別の成績（エッジが高い順）\n")
+    lines.append(
+        f"4つのシグナルの全組み合わせ（単体〜4つ全部、計15通り）について、"
+        f"該当シグナルをすべて満たす場合の成績を計算し、エッジが高い順に並べたものです"
+        f"（発生回数が{MIN_COMBO_N}回未満の組み合わせはノイズとして除外しています）。"
+        f"**この表の上位が、実際にエッジのある「入るべき条件」の候補です。**\n"
+    )
+    if len(by_combo_df):
+        lines.append("| 組み合わせ | 発生回数 | 的中率 | ベースライン比(edge) | 平均リターン | 中央値リターン |")
+        lines.append("|---|---|---|---|---|---|")
+        for _, r in by_combo_df.iterrows():
+            lines.append(
+                f"| {r['label']} | {int(r['n'])} | {r['win_rate_pct']}% | "
+                f"{r['edge_over_baseline_pct']:+.1f}pt | {r['mean_return_pct']}% | {r['median_return_pct']}% |"
+            )
+    else:
+        lines.append(f"（発生回数が{MIN_COMBO_N}回以上ある組み合わせがありませんでした）")
+    lines.append("")
+
     lines.append("## 銘柄別のデータ取得状況\n")
     lines.append("| 銘柄 | 取得期間 | 年数 | シグナル発生回数 |")
     lines.append("|---|---|---|---|")
@@ -314,12 +374,17 @@ def main():
     lines.append("- 相場全体が上昇トレンドの期間が長い銘柄ほど、的中率・平均リターンが高く出やすい傾向があります（銘柄選定バイアス）。")
     lines.append("- サンプル数（発生回数）が少ないシグナル・銘柄の数字は誤差が大きいため、参考程度にしてください。")
     lines.append("- 手数料・スリッページは考慮していません。")
+    lines.append(
+        "- 組み合わせ別の表は15通りを一度に比較しているため、たまたま良く見える組み合わせが"
+        "混ざる可能性があります（多重比較の問題）。エッジが際立って大きく、かつ発生回数も"
+        "十分多い組み合わせほど信頼度が高いと考えてください。"
+    )
     lines.append("- 本レポートは投資助言ではありません。投資判断はご自身の責任で行ってください。")
 
     with open(REPORT_MD, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-    print(f"\n{BY_SCORE_CSV} / {BY_SIGNAL_CSV} / {COVERAGE_CSV} / {REPORT_MD} を保存しました。")
+    print(f"\n{BY_SCORE_CSV} / {BY_SIGNAL_CSV} / {BY_COMBO_CSV} / {COVERAGE_CSV} / {REPORT_MD} を保存しました。")
 
 
 if __name__ == "__main__":
