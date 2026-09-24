@@ -1,0 +1,15 @@
+﻿combo,label,n_signals,n,win_rate_pct,mean_return_pct,median_return_pct,edge_over_baseline_pct
+volume_spike+rsi_rebound,出来高急増 + RSI反発,2,3289,29.8,1.02,0.61,8.5
+volume_spike+golden_cross+rsi_rebound,出来高急増 + ゴールデンクロス + RSI反発,3,46,28.3,9.25,0.04,7.0
+volume_spike,出来高急増,1,21385,26.7,0.67,0.15,5.5
+volume_spike+golden_cross,出来高急増 + ゴールデンクロス,2,751,24.9,0.93,-0.3,3.6
+golden_cross+rsi_rebound,ゴールデンクロス + RSI反発,2,172,22.7,2.46,-0.15,1.4
+golden_cross,ゴールデンクロス,1,9749,20.7,0.38,-0.1,-0.5
+volume_spike+bb_squeeze+golden_cross,出来高急増 + ボラティリティ収縮 + ゴールデンクロス,3,113,20.4,0.04,-0.43,-0.9
+rsi_rebound,RSI反発,1,98161,20.1,0.03,0.04,-1.1
+bb_squeeze+golden_cross+rsi_rebound,ボラティリティ収縮 + ゴールデンクロス + RSI反発,3,54,18.5,-0.07,-1.28,-2.8
+volume_spike+bb_squeeze,出来高急増 + ボラティリティ収縮,2,2290,18.2,-0.1,-0.15,-3.1
+volume_spike+bb_squeeze+rsi_rebound,出来高急増 + ボラティリティ収縮 + RSI反発,3,204,18.1,0.44,-0.02,-3.1
+bb_squeeze+golden_cross,ボラティリティ収縮 + ゴールデンクロス,2,2850,18.2,0.04,-0.16,-3.1
+bb_squeeze,ボラティリティ収縮,1,77903,17.3,-0.14,-0.16,-4.0
+bb_squeeze+rsi_rebound,ボラティリティ収縮 + RSI反発,2,7490,16.1,-0.21,-0.17,-5.2
