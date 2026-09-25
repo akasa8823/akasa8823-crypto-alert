@@ -1,0 +1,55 @@
+name: crypto-target-reach-analysis
+
+on:
+  workflow_dispatch: {}   # 手動実行専用（Actionsタブから "Run workflow" で実行してください）
+
+permissions:
+  contents: write
+
+jobs:
+  target-reach-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run target reach analysis
+        env:
+          TARGET_SYMBOLS: "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT"
+        run: python target_reach_analysis.py
+
+      - name: Commit report
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          files="target_reach_trades.csv target_reach_report.md"
+          existing=""
+          for f in $files; do
+            if [ -f "$f" ]; then existing="$existing $f"; fi
+          done
+          if [ -z "$existing" ]; then
+            echo "no files to commit"
+            exit 0
+          fi
+          git add $existing
+          if git diff --staged --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git commit -m "update target reach report [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "push failed, retrying ($i)..."
+            sleep $((RANDOM % 10 + 5))
+          done
+          echo "push failed after retries"
+          exit 1
