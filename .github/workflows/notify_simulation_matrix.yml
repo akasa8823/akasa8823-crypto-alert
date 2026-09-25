@@ -1,0 +1,41 @@
+name: crypto-notify-simulation-matrix
+
+on:
+  workflow_dispatch: {}   # 手動実行専用（Actionsタブから "Run workflow" で実行してください）
+
+permissions:
+  contents: write
+
+jobs:
+  notify-simulation-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scenario matrix simulation
+        run: python notify_simulation_matrix.py
+
+      - name: Commit report
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          files="notify_simulation_matrix_trades.csv notify_simulation_matrix.csv notify_simulation_matrix_report.md"
+          existing=""
+          for f in $files; do
+            if [ -f "$f" ]; then existing="$existing $f"; fi
+          done
+          if [ -n "$existing" ]; then
+            git add $existing
+            git diff --staged --quiet || git commit -m "update notify simulation matrix report [skip ci]"
+            git push
+          else
+            echo "no files to commit"
+          fi
