@@ -96,6 +96,7 @@ ALERTS_LOG_CSV = "alerts_log.csv"
 ACCURACY_CSV = "accuracy_report.csv"
 SIGNAL_ACCURACY_CSV = "signal_accuracy.csv"
 NOTIFY_PERFORMANCE_CSV = "notify_performance_log.csv"
+NOTIFY_PERFORMANCE_REPORT_MD = "notify_performance_report.md"
 
 ALERTS_LOG_COLUMNS = [
     "id", "symbol", "signal_at_utc", "score",
@@ -244,11 +245,19 @@ def load_alerts_log() -> pd.DataFrame:
     if os.path.exists(ALERTS_LOG_CSV):
         try:
             df = pd.read_csv(ALERTS_LOG_CSV)
+            # 未決着行が全てNaNの列があると、pandasがfloat64型と推論してしまい、
+            # 後で .at[] で文字列やTrue/Falseを代入する際に型エラーになるため、
+            # 読み込み直後に全列をobject型へ固定しておく
+            df = df.astype(object)
             for col in ["resolved", "hit", "volume_spike", "bb_squeeze", "golden_cross", "rsi_rebound"]:
                 if col in df.columns:
-                    df[col] = df[col].map(
-                        lambda v: True if str(v) == "True" else (False if str(v) == "False" else v)
-                    )
+                    mapped = [
+                        True if str(v) == "True" else (False if str(v) == "False" else v)
+                        for v in df[col]
+                    ]
+                    # pandasは代入時にNaNのみの列をfloat64へ再推論してしまうことがあるため、
+                    # 明示的にobject dtypeのSeriesとして代入する
+                    df[col] = pd.Series(mapped, index=df.index, dtype=object)
             for col in ALERTS_LOG_COLUMNS:
                 if col not in df.columns:
                     df[col] = None
@@ -403,11 +412,19 @@ def load_notify_performance_log() -> pd.DataFrame:
     if os.path.exists(NOTIFY_PERFORMANCE_CSV):
         try:
             df = pd.read_csv(NOTIFY_PERFORMANCE_CSV)
+            # 未決着行が全てNaNの列があると、pandasがfloat64型と推論してしまい、
+            # 後で .at[] で文字列やTrue/Falseを代入する際に型エラーになるため、
+            # 読み込み直後に全列をobject型へ固定しておく
+            df = df.astype(object)
             for col in ["resolved", "hit"]:
                 if col in df.columns:
-                    df[col] = df[col].map(
-                        lambda v: True if str(v) == "True" else (False if str(v) == "False" else v)
-                    )
+                    mapped = [
+                        True if str(v) == "True" else (False if str(v) == "False" else v)
+                        for v in df[col]
+                    ]
+                    # pandasは代入時にNaNのみの列をfloat64へ再推論してしまうことがあるため、
+                    # 明示的にobject dtypeのSeriesとして代入する
+                    df[col] = pd.Series(mapped, index=df.index, dtype=object)
             for col in NOTIFY_PERFORMANCE_COLUMNS:
                 if col not in df.columns:
                     df[col] = None
@@ -532,6 +549,95 @@ def print_notify_performance_report(log: pd.DataFrame):
               f"決済={r['resolved_at_utc']} リターン={r['outcome_pct']:+.2f}%")
 
 
+def generate_notify_performance_report(log: pd.DataFrame):
+    """本番成績をGitHub上で読みやすいMarkdownレポートとして書き出す。
+    実行のたびに notify_performance_log.csv の最新状態から作り直すため、
+    常に最新の集計結果を反映する。
+    """
+    lines = []
+    lines.append("# 本番成績レポート")
+    lines.append("")
+    lines.append(f"最終更新(UTC): {datetime.now(timezone.utc).isoformat()}")
+    lines.append("")
+    lines.append(
+        f"実際にスマホへ通知した銘柄が、その後 **+{NOTIFY_TAKE_PROFIT_PCT:g}%**（利確目標）まで"
+        f"到達したか、それとも **{NOTIFY_MAX_HOLD_DAYS:g}日** 以内に到達できず期限切れ決済に"
+        f"なったかをまとめたものです。"
+    )
+    lines.append("")
+    lines.append("※投資助言ではありません。過去の記録であり、将来の成績を保証するものではありません。")
+    lines.append("")
+
+    if len(log) == 0:
+        lines.append("まだ通知の記録がありません。")
+        _write_report_md(lines)
+        return
+
+    resolved = log[log["resolved"] == True].copy()  # noqa: E712
+    pending = log[log["resolved"] != True].copy()  # noqa: E712
+
+    lines.append("## サマリー")
+    lines.append("")
+    lines.append(f"- 通知件数: {len(log)}件（決着済み {len(resolved)}件 / 保有中 {len(pending)}件）")
+
+    # outcome_pct が全て欠損（想定外のデータ不整合）の場合に備えた防御的チェック
+    if len(resolved) > 0:
+        resolved["outcome_pct"] = resolved["outcome_pct"].astype(float)
+        if resolved["outcome_pct"].notna().sum() == 0:
+            resolved = resolved.iloc[0:0]
+    if len(resolved) > 0:
+        win_rate = (resolved["hit"] == True).mean() * 100  # noqa: E712
+        avg_return = resolved["outcome_pct"].mean()
+        avg_days = resolved["days_held"].astype(float).mean()
+        best = resolved.loc[resolved["outcome_pct"].idxmax()]
+        worst = resolved.loc[resolved["outcome_pct"].idxmin()]
+        lines.append(f"- 利確到達率: **{win_rate:.1f}%**（{len(resolved)}件中）")
+        lines.append(f"- 平均リターン: **{avg_return:+.2f}%**")
+        lines.append(f"- 平均保有日数: {avg_days:.1f}日")
+        lines.append(
+            f"- ベスト: {best['symbol']} {best['outcome_pct']:+.2f}%"
+            f"（通知={best['notified_at_utc']}）"
+        )
+        lines.append(
+            f"- ワースト: {worst['symbol']} {worst['outcome_pct']:+.2f}%"
+            f"（通知={worst['notified_at_utc']}）"
+        )
+    else:
+        lines.append("- 決着済みの通知はまだありません。")
+    lines.append("")
+
+    if len(pending) > 0:
+        lines.append("## 保有中（決着待ち）")
+        lines.append("")
+        lines.append("| 銘柄 | 通知時刻(UTC) | エントリー価格 | 目標価格(+{:g}%) |".format(NOTIFY_TAKE_PROFIT_PCT))
+        lines.append("|---|---|---|---|")
+        for _, r in pending.sort_values("notified_at_utc", ascending=False).iterrows():
+            lines.append(
+                f"| {r['symbol']} | {r['notified_at_utc']} | {r['entry_price']:,.2f} | {r['target_price']:,.2f} |"
+            )
+        lines.append("")
+
+    if len(resolved) > 0:
+        lines.append("## 決着済み履歴（新しい順）")
+        lines.append("")
+        lines.append("| 銘柄 | 通知時刻(UTC) | 決済時刻(UTC) | 結果 | リターン | 保有日数 |")
+        lines.append("|---|---|---|---|---|---|")
+        for _, r in resolved.sort_values("notified_at_utc", ascending=False).iterrows():
+            result_label = "✅ 利確到達" if r["hit"] else "⏱ 期限切れ決済"
+            lines.append(
+                f"| {r['symbol']} | {r['notified_at_utc']} | {r['resolved_at_utc']} | "
+                f"{result_label} | {r['outcome_pct']:+.2f}% | {float(r['days_held']):.1f}日 |"
+            )
+        lines.append("")
+
+    _write_report_md(lines)
+
+
+def _write_report_md(lines: list):
+    with open(NOTIFY_PERFORMANCE_REPORT_MD, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 # ============================================================
 # 状態（通知済み・記録済みの銘柄セット）
 # ============================================================
@@ -605,6 +711,46 @@ def send_notification(new_alerts: set, latest_rows: dict):
         print(f"通知送信に失敗しました: {e}")
 
 
+def send_exit_notification(newly_resolved: pd.DataFrame):
+    """本番成績トラッキングで新たに決着（利確到達 or 期限切れ決済）した通知について、
+    結果をスマホへプッシュ通知する。
+    """
+    if not NTFY_TOPIC:
+        print("NTFY_TOPIC が未設定のため決済通知をスキップしました。")
+        return
+    if len(newly_resolved) == 0:
+        return
+    blocks = []
+    any_hit = False
+    for _, r in newly_resolved.sort_values("symbol").iterrows():
+        hit = bool(r["hit"])
+        any_hit = any_hit or hit
+        result_label = "利確ライン到達" if hit else "保有期限切れで決済"
+        mark = "🎯" if hit else "⏱"
+        lines = [f"{mark} {r['symbol']} {result_label}"]
+        lines.append(f"エントリー価格: {float(r['entry_price']):,.2f} USDT")
+        lines.append(f"決済価格: {float(r['exit_price']):,.2f} USDT")
+        lines.append(f"リターン: {float(r['outcome_pct']):+.2f}%")
+        lines.append(f"保有日数: {float(r['days_held']):.1f}日")
+        blocks.append("\n".join(lines))
+    body = "\n\n".join(blocks) + "\n\n※投資助言ではありません。実際の売買・利確はご自身の判断で行ってください。"
+    title = "Crypto Signal Exit" if any_hit else "Crypto Signal Update"
+    try:
+        requests.post(
+            f"{NTFY_SERVER}/{NTFY_TOPIC}",
+            data=body.encode("utf-8"),
+            headers={
+                "Title": title,
+                "Priority": "default",
+                "Tags": "moneybag" if any_hit else "hourglass",
+            },
+            timeout=10,
+        )
+        print(f"決済通知を送信しました: {', '.join(sorted(newly_resolved['symbol'].tolist()))}")
+    except Exception as e:
+        print(f"決済通知の送信に失敗しました: {e}")
+
+
 # ============================================================
 # メイン処理
 # ============================================================
@@ -625,6 +771,7 @@ def main():
     all_backtest_rows = []
     new_notify_active = set()
     new_log_active = set()
+    newly_resolved_perf_rows = []
 
     for i, symbol in enumerate(SYMBOLS, 1):
         try:
@@ -681,7 +828,18 @@ def main():
 
             # 本番成績トラッキング: 保有中の通知があれば、今回取得したデータで
             # 利確ライン到達・期限切れを判定して結果を書き戻す
+            # （決済通知を送るため、判定前後で「未決着だったID」の差分を取り、
+            #   今回新たに決着したものだけを控えておく）
+            before_ids = set(
+                notify_perf_log[
+                    (notify_perf_log["symbol"] == symbol) & (notify_perf_log["resolved"] != True)  # noqa: E712
+                ]["id"]
+            )
             notify_perf_log = resolve_notify_performance_for_symbol(notify_perf_log, symbol, df)
+            if before_ids:
+                newly_resolved_mask = notify_perf_log["id"].isin(before_ids) & (notify_perf_log["resolved"] == True)  # noqa: E712
+                if newly_resolved_mask.any():
+                    newly_resolved_perf_rows.append(notify_perf_log[newly_resolved_mask].copy())
 
             print(f"[{i}/{len(SYMBOLS)}] {symbol:12s} score={row['score']}")
         except Exception as e:
@@ -735,6 +893,12 @@ def main():
 
     save_notify_performance_log(notify_perf_log)
     print_notify_performance_report(notify_perf_log)
+    generate_notify_performance_report(notify_perf_log)
+
+    if newly_resolved_perf_rows:
+        newly_resolved_df = pd.concat(newly_resolved_perf_rows, ignore_index=True)
+        print(f"\n決済（決着）した通知: {', '.join(sorted(newly_resolved_df['symbol'].tolist()))}")
+        send_exit_notification(newly_resolved_df)
 
     save_state(new_notify_active, new_log_active)
 
