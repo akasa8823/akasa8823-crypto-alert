@@ -17,8 +17,10 @@ GitHub Actions などのスケジューラ上で定期実行される想定の�
        的中/不的中・リターンを書き戻す
      - こうして「本当に検出→通知したシグナル」の的中率が回を追うごとに
        蓄積されていく（synthetic backtestより信頼できる実績データ）
-  5. 直近バーでシグナルが ALERT_MIN_SCORE 個以上重なっている銘柄のうち、
-     前回まで検出されていなかった「新規」のものだけ ntfy.sh 経由で通知
+  5. 直近バーで「出来高急増 かつ RSI反発」が新たに成立した銘柄（BTCUSDTのみ）
+     のうち、前回まで検出されていなかった「新規」のものだけ ntfy.sh 経由で通知
+     （deep_backtest.py / notify_simulation.py での長期検証で、このシグナルの
+     組み合わせが最も安定してエッジ（優位性）を持つことが確認されたため）
 
 ★ 重要な注意
 - バックテスト・実績追跡はいずれも過去データ上の集計であり、将来の的中を
@@ -44,14 +46,10 @@ except ImportError:
 # 設定（必要に応じて編集してください）
 # ============================================================
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "BNBUSDT", "SOLUSDT",
-    "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT",
-    "DOTUSDT", "LTCUSDT", "BCHUSDT", "XLMUSDT", "ATOMUSDT",
-    "ETCUSDT", "FILUSDT", "APTUSDT", "NEARUSDT", "ARBUSDT",
-    "OPUSDT", "SUIUSDT", "SHIBUSDT", "UNIUSDT", "AAVEUSDT",
-    "SANDUSDT", "MANAUSDT", "AXSUSDT", "ENJUSDT", "CHZUSDT",
-]
+# deep_backtest.py / notify_simulation.py での検証の結果、BTCUSDT単体・
+# 「出来高急増 かつ RSI反発」の組み合わせが、最も安定してエッジ（優位性）が
+# 確認できたため、対象銘柄をBTCUSDTのみに絞っています。
+SYMBOLS = ["BTCUSDT"]
 
 INTERVAL = "1h"            # ローソク足の間隔
 LOOKBACK_BARS = 500         # 取得本数（Binanceの上限は1000）
@@ -75,7 +73,16 @@ HORIZON_BARS = 24            # シグナル発生から何本先の値動きを�
 SUCCESS_THRESHOLD_PCT = 3.0  # この%以上の上昇を「的中」とみなす
 
 # --- 通知設定 ---
-ALERT_MIN_SCORE = int(os.environ.get("ALERT_MIN_SCORE", "3"))
+# 通知条件: deep_backtest.py の組み合わせ別エッジ分析で最も優位性が確認できた
+# 「出来高急増 かつ RSI反発」の組み合わせが新規に成立した場合のみ通知する。
+# （スコア単純合計にはエッジが薄いことが検証で判明したため、score>=Nベースの
+#   閾値通知（旧ALERT_MIN_SCORE）から切り替えた）
+NOTIFY_REQUIRE_VOLUME_SPIKE = os.environ.get("NOTIFY_REQUIRE_VOLUME_SPIKE", "1") != "0"
+NOTIFY_REQUIRE_RSI_REBOUND = os.environ.get("NOTIFY_REQUIRE_RSI_REBOUND", "1") != "0"
+# target_reach_analysis.py での検証で、+5%より+10%まで持った方がリスクを
+# ほとんど増やさずリターンを大きく伸ばせることが確認できたため、通知本文に
+# +10%の目標価格を参考として添える（実際の売買判断はご自身で行ってください）
+NOTIFY_TAKE_PROFIT_PCT = float(os.environ.get("NOTIFY_TAKE_PROFIT_PCT", "10.0"))
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
@@ -415,7 +422,13 @@ def send_notification(new_alerts: set, latest_rows: dict):
     lines = []
     for sym in sorted(new_alerts):
         r = latest_rows.get(sym, {})
-        lines.append(f"{sym}: score={r.get('score')} price={r.get('price')} rsi={r.get('rsi')}")
+        price = r.get("price")
+        target = round(price * (1 + NOTIFY_TAKE_PROFIT_PCT / 100), 2) if price else None
+        lines.append(
+            f"{sym}: price={price} 目安の利確ライン(+{NOTIFY_TAKE_PROFIT_PCT:g}%)={target} "
+            f"出来高倍率={r.get('volume_ratio')}x RSI={r.get('rsi')} "
+            f"(score={r.get('score')})"
+        )
     body = "\n".join(lines)
     try:
         requests.post(
@@ -487,9 +500,15 @@ def main():
             }
             latest_rows[symbol] = row
 
+            notify_condition = True
+            if NOTIFY_REQUIRE_VOLUME_SPIKE:
+                notify_condition = notify_condition and row["volume_spike"]
+            if NOTIFY_REQUIRE_RSI_REBOUND:
+                notify_condition = notify_condition and row["rsi_rebound"]
+
             if row["score"] >= 1:
                 new_log_active.add(symbol)
-            if row["score"] >= ALERT_MIN_SCORE:
+            if notify_condition:
                 new_notify_active.add(symbol)
 
             # 新規にシグナルが立った瞬間だけ記録（同じ状態が続く間は再記録しない）
