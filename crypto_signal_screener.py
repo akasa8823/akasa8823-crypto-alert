@@ -83,6 +83,9 @@ NOTIFY_REQUIRE_RSI_REBOUND = os.environ.get("NOTIFY_REQUIRE_RSI_REBOUND", "1") !
 # ほとんど増やさずリターンを大きく伸ばせることが確認できたため、通知本文に
 # +10%の目標価格を参考として添える（実際の売買判断はご自身で行ってください）
 NOTIFY_TAKE_PROFIT_PCT = float(os.environ.get("NOTIFY_TAKE_PROFIT_PCT", "10.0"))
+# 通知（＝実運用でのエントリー想定）が、その後NOTIFY_TAKE_PROFIT_PCTまで到達したか
+# どうかを追跡する「本番成績」の最大保有期間（notify_simulation.py と同じ考え方）
+NOTIFY_MAX_HOLD_DAYS = float(os.environ.get("NOTIFY_MAX_HOLD_DAYS", "60"))
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
@@ -92,12 +95,21 @@ BACKTEST_CSV = "backtest_report.csv"
 ALERTS_LOG_CSV = "alerts_log.csv"
 ACCURACY_CSV = "accuracy_report.csv"
 SIGNAL_ACCURACY_CSV = "signal_accuracy.csv"
+NOTIFY_PERFORMANCE_CSV = "notify_performance_log.csv"
 
 ALERTS_LOG_COLUMNS = [
     "id", "symbol", "signal_at_utc", "score",
     "volume_spike", "bb_squeeze", "golden_cross", "rsi_rebound",
     "price_at_signal", "resolve_at_utc",
     "resolved", "resolved_at_utc", "price_resolved", "outcome_pct", "hit",
+]
+
+# 「実際に通知した」瞬間だけを対象にした成績トラッキング用の列
+# （alerts_log.csv は score>=1 の全記録、こちらは実際に通知した銘柄のみ）
+NOTIFY_PERFORMANCE_COLUMNS = [
+    "id", "symbol", "notified_at_utc", "entry_price",
+    "target_price", "target_pct", "max_hold_until_utc",
+    "resolved", "resolved_at_utc", "exit_price", "outcome_pct", "hit", "days_held",
 ]
 
 BASE_URL = "https://data-api.binance.vision"
@@ -383,6 +395,144 @@ def print_signal_accuracy_report(resolved: pd.DataFrame):
 
 
 # ============================================================
+# 本番成績トラッキング（実際に通知した銘柄が、その後+NOTIFY_TAKE_PROFIT_PCTまで
+# 到達したかどうかを追跡する）
+# ============================================================
+
+def load_notify_performance_log() -> pd.DataFrame:
+    if os.path.exists(NOTIFY_PERFORMANCE_CSV):
+        try:
+            df = pd.read_csv(NOTIFY_PERFORMANCE_CSV)
+            for col in ["resolved", "hit"]:
+                if col in df.columns:
+                    df[col] = df[col].map(
+                        lambda v: True if str(v) == "True" else (False if str(v) == "False" else v)
+                    )
+            for col in NOTIFY_PERFORMANCE_COLUMNS:
+                if col not in df.columns:
+                    df[col] = None
+            return df[NOTIFY_PERFORMANCE_COLUMNS]
+        except Exception as e:
+            print(f"{NOTIFY_PERFORMANCE_CSV} の読み込みに失敗: {e}")
+    return pd.DataFrame(columns=NOTIFY_PERFORMANCE_COLUMNS)
+
+
+def save_notify_performance_log(df: pd.DataFrame):
+    df.to_csv(NOTIFY_PERFORMANCE_CSV, index=False, encoding="utf-8-sig")
+
+
+def append_notify_performance(log: pd.DataFrame, symbol: str, notified_at, entry_price: float) -> pd.DataFrame:
+    entry_id = f"{symbol}-{int(pd.Timestamp(notified_at).timestamp())}"
+    if len(log) and (log["id"] == entry_id).any():
+        return log
+    if entry_price is None or entry_price <= 0:
+        return log
+    target_price = entry_price * (1 + NOTIFY_TAKE_PROFIT_PCT / 100)
+    max_hold_until = pd.Timestamp(notified_at) + pd.Timedelta(days=NOTIFY_MAX_HOLD_DAYS)
+    new_row = {
+        "id": entry_id,
+        "symbol": symbol,
+        "notified_at_utc": str(notified_at),
+        "entry_price": entry_price,
+        "target_price": round(target_price, 8),
+        "target_pct": NOTIFY_TAKE_PROFIT_PCT,
+        "max_hold_until_utc": str(max_hold_until),
+        "resolved": False,
+        "resolved_at_utc": None,
+        "exit_price": None,
+        "outcome_pct": None,
+        "hit": None,
+        "days_held": None,
+    }
+    return pd.concat([log, pd.DataFrame([new_row])], ignore_index=True)
+
+
+def resolve_notify_performance_for_symbol(log: pd.DataFrame, symbol: str, price_df: pd.DataFrame) -> pd.DataFrame:
+    if len(log) == 0:
+        return log
+    mask = (log["symbol"] == symbol) & (log["resolved"] != True)  # noqa: E712
+    if not mask.any():
+        return log
+    times = pd.to_datetime(price_df["open_time"], utc=True).reset_index(drop=True)
+    highs = price_df["high"].reset_index(drop=True)
+    closes = price_df["close"].reset_index(drop=True)
+    now = datetime.now(timezone.utc)
+
+    for idx in log[mask].index:
+        try:
+            entry_time = pd.Timestamp(log.at[idx, "notified_at_utc"])
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.tz_localize("UTC")
+        except Exception:
+            continue
+        entry_price = float(log.at[idx, "entry_price"])
+        target_price = float(log.at[idx, "target_price"])
+        if entry_price <= 0:
+            continue
+
+        window_mask = times >= entry_time
+        if window_mask.any():
+            sub_times = times[window_mask]
+            sub_highs = highs[window_mask]
+            hit_mask = sub_highs >= target_price
+            if hit_mask.any():
+                hit_time = sub_times[hit_mask].iloc[0]
+                days_held = (hit_time - entry_time).total_seconds() / 86400
+                log.at[idx, "resolved"] = True
+                log.at[idx, "hit"] = True
+                log.at[idx, "resolved_at_utc"] = str(hit_time)
+                log.at[idx, "exit_price"] = target_price
+                log.at[idx, "outcome_pct"] = round((target_price - entry_price) / entry_price * 100, 2)
+                log.at[idx, "days_held"] = round(days_held, 2)
+                continue
+
+        try:
+            max_hold_until = pd.Timestamp(log.at[idx, "max_hold_until_utc"])
+            if max_hold_until.tzinfo is None:
+                max_hold_until = max_hold_until.tz_localize("UTC")
+        except Exception:
+            continue
+        if now >= max_hold_until.to_pydatetime() and len(closes) > 0:
+            current_price = float(closes.iloc[-1])
+            days_held = (now - entry_time.to_pydatetime()).total_seconds() / 86400
+            log.at[idx, "resolved"] = True
+            log.at[idx, "hit"] = False
+            log.at[idx, "resolved_at_utc"] = str(now)
+            log.at[idx, "exit_price"] = current_price
+            log.at[idx, "outcome_pct"] = round((current_price - entry_price) / entry_price * 100, 2)
+            log.at[idx, "days_held"] = round(days_held, 2)
+
+    return log
+
+
+def print_notify_performance_report(log: pd.DataFrame):
+    print("\n" + "=" * 70)
+    print(f"■ 本番成績（実際に通知した銘柄が+{NOTIFY_TAKE_PROFIT_PCT:g}%まで到達したか）")
+    print("=" * 70)
+    if len(log) == 0:
+        print("まだ通知の記録がありません。")
+        return
+    resolved = log[log["resolved"] == True].copy()  # noqa: E712
+    pending = log[log["resolved"] != True]  # noqa: E712
+    print(f"通知件数: {len(log)}（決着済み {len(resolved)} / 保有中 {len(pending)}）")
+    if len(pending) > 0:
+        for _, r in pending.sort_values("notified_at_utc").iterrows():
+            print(f"  [保有中] {r['symbol']} 通知時刻={r['notified_at_utc']} "
+                  f"エントリー価格={r['entry_price']} 目標価格={r['target_price']}")
+    if len(resolved) == 0:
+        print("決着済みの通知がまだありません。")
+        return
+    resolved["outcome_pct"] = resolved["outcome_pct"].astype(float)
+    win_rate = (resolved["hit"] == True).mean() * 100  # noqa: E712
+    avg_return = resolved["outcome_pct"].mean()
+    print(f"決着済み {len(resolved)}件: 利確到達率 {win_rate:.1f}% / 平均リターン {avg_return:+.2f}%")
+    for _, r in resolved.sort_values("notified_at_utc").iterrows():
+        result_label = "利確到達" if r["hit"] else "期限切れ決済"
+        print(f"  [{result_label}] {r['symbol']} 通知={r['notified_at_utc']} → "
+              f"決済={r['resolved_at_utc']} リターン={r['outcome_pct']:+.2f}%")
+
+
+# ============================================================
 # 状態（通知済み・記録済みの銘柄セット）
 # ============================================================
 
@@ -419,18 +569,27 @@ def send_notification(new_alerts: set, latest_rows: dict):
     if not NTFY_TOPIC:
         print("NTFY_TOPIC が未設定のため通知をスキップしました。")
         return
-    lines = []
+    blocks = []
     for sym in sorted(new_alerts):
         r = latest_rows.get(sym, {})
         price = r.get("price")
         target = round(price * (1 + NOTIFY_TAKE_PROFIT_PCT / 100), 2) if price else None
-        lines.append(
-            f"{sym}: price={price} 目安の利確ライン(+{NOTIFY_TAKE_PROFIT_PCT:g}%)={target} "
-            f"出来高倍率={r.get('volume_ratio')}x RSI={r.get('rsi')} "
-            f"(score={r.get('score')})"
-        )
-    body = "\n".join(lines)
+        vr = r.get("volume_ratio")
+        rsi = r.get("rsi")
+        lines = [f"■ {sym} シグナル発生"]
+        if price is not None:
+            lines.append(f"現在価格: {price:,.2f} USDT")
+        if target is not None:
+            lines.append(f"利確の目安（+{NOTIFY_TAKE_PROFIT_PCT:g}%）: {target:,.2f} USDT")
+        if vr is not None:
+            lines.append(f"出来高: 平均の{vr}倍")
+        if rsi is not None:
+            lines.append(f"RSI: {rsi}")
+        blocks.append("\n".join(lines))
+    body = "\n\n".join(blocks) + "\n\n※投資助言ではありません。売買判断はご自身で行ってください。"
     try:
+        # ntfy.sh はHTTPヘッダーに非ASCII文字を直接渡すとエラーになるため、
+        # タイトルは英語のままにし、日本語の本文はボディ（UTF-8）側に入れる
         requests.post(
             f"{NTFY_SERVER}/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
@@ -460,6 +619,7 @@ def main():
     prev_log_active = set(prev_state["log_active"])
 
     alerts_log = load_alerts_log()
+    notify_perf_log = load_notify_performance_log()
 
     latest_rows = {}
     all_backtest_rows = []
@@ -519,6 +679,10 @@ def main():
             # この銘柄について、検証待ちのものがあれば結果を書き戻す
             alerts_log = resolve_alerts_for_symbol(alerts_log, symbol, df)
 
+            # 本番成績トラッキング: 保有中の通知があれば、今回取得したデータで
+            # 利確ライン到達・期限切れを判定して結果を書き戻す
+            notify_perf_log = resolve_notify_performance_for_symbol(notify_perf_log, symbol, df)
+
             print(f"[{i}/{len(SYMBOLS)}] {symbol:12s} score={row['score']}")
         except Exception as e:
             print(f"[{i}/{len(SYMBOLS)}] {symbol}: エラー ({e})")
@@ -562,8 +726,15 @@ def main():
     if truly_new_notify:
         print(f"\n新規アラート: {', '.join(sorted(truly_new_notify))}")
         send_notification(truly_new_notify, latest_rows)
+        now_utc = datetime.now(timezone.utc)
+        for sym in truly_new_notify:
+            r = latest_rows.get(sym, {})
+            notify_perf_log = append_notify_performance(notify_perf_log, sym, now_utc, r.get("price"))
     else:
         print("\n新規アラートなし（既に通知済み、または該当なし）")
+
+    save_notify_performance_log(notify_perf_log)
+    print_notify_performance_report(notify_perf_log)
 
     save_state(new_notify_active, new_log_active)
 
