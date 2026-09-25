@@ -1,3 +1,32 @@
+name: crypto-signal-screener
+
+on:
+  schedule:
+    # UTC基準。デフォルトは30分おき。頻度を変えたい場合はここを編集してください。
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # 手動実行用（Actionsタブから "Run workflow" で即実行できます）
+
+permissions:
+  contents: write
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screener
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python crypto_signal_screener.py
+
       - name: Commit updated state/results
         run: |
           git config user.name "signal-bot"
