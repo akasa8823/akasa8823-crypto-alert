@@ -1,0 +1,56 @@
+name: crypto-notify-simulation-matrix-tp10
+
+on:
+  workflow_dispatch: {}   # 手動実行専用（Actionsタブから "Run workflow" で実行してください）
+
+permissions:
+  contents: write
+
+jobs:
+  notify-simulation-matrix-tp10:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scenario matrix simulation (take-profit +10%)
+        env:
+          SIM_TAKE_PROFIT_PCT: "10.0"
+          MATRIX_OUTPUT_PREFIX: "notify_simulation_matrix_tp10"
+        run: python notify_simulation_matrix.py
+
+      - name: Commit report
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          files="notify_simulation_matrix_tp10_trades.csv notify_simulation_matrix_tp10.csv notify_simulation_matrix_tp10_report.md"
+          existing=""
+          for f in $files; do
+            if [ -f "$f" ]; then existing="$existing $f"; fi
+          done
+          if [ -z "$existing" ]; then
+            echo "no files to commit"
+            exit 0
+          fi
+          git add $existing
+          if git diff --staged --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git commit -m "update notify simulation matrix (tp10) report [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "push failed, retrying ($i)..."
+            sleep $((RANDOM % 10 + 5))
+          done
+          echo "push failed after retries"
+          exit 1
