@@ -66,9 +66,13 @@ FRACTIONS = [0.10, 0.15, 0.20]
 # 比較に必要な銘柄の和集合（全30銘柄なら結局これで全部）
 ALL_NEEDED_SYMBOLS = sorted(set(sym for syms in SYMBOL_TIERS.values() for sym in syms))
 
-TRADES_CSV = "notify_simulation_matrix_trades.csv"
-MATRIX_CSV = "notify_simulation_matrix.csv"
-REPORT_MD = "notify_simulation_matrix_report.md"
+# 出力ファイル名の接頭辞。利確ラインを変えて比較する際など、以前の結果を
+# 上書きしたくない場合は MATRIX_OUTPUT_PREFIX 環境変数で変更できる
+# （例: "notify_simulation_matrix_tp10" なら +10%版の結果として別名保存される）
+_OUTPUT_PREFIX = os.environ.get("MATRIX_OUTPUT_PREFIX", "notify_simulation_matrix")
+TRADES_CSV = f"{_OUTPUT_PREFIX}_trades.csv"
+MATRIX_CSV = f"{_OUTPUT_PREFIX}.csv"
+REPORT_MD = f"{_OUTPUT_PREFIX}_report.md"
 
 
 # ============================================================
