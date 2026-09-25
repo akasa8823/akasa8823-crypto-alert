@@ -31,7 +31,7 @@ jobs:
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          files="alert_state.json signals_result.csv backtest_report.csv alerts_log.csv accuracy_report.csv signal_accuracy.csv notify_performance_log.csv"
+          files="alert_state.json signals_result.csv backtest_report.csv alerts_log.csv accuracy_report.csv signal_accuracy.csv notify_performance_log.csv notify_performance_report.md"
           existing=""
           for f in $files; do
             if [ -f "$f" ]; then existing="$existing $f"; fi
@@ -46,6 +46,8 @@ jobs:
             exit 0
           fi
           git commit -m "update signal state [skip ci]"
+          # 他のワークフロー（手動実行の長時間バックテスト等）が先にpushしていることがあるため、
+          # pull --rebase してからpush、失敗したらリトライする
           for i in 1 2 3; do
             if git pull --rebase origin main && git push; then
               exit 0
