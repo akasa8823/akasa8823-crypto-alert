@@ -31,7 +31,7 @@ jobs:
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          files="alert_state.json signals_result.csv backtest_report.csv alerts_log.csv accuracy_report.csv signal_accuracy.csv"
+          files="alert_state.json signals_result.csv backtest_report.csv alerts_log.csv accuracy_report.csv signal_accuracy.csv notify_performance_log.csv"
           existing=""
           for f in $files; do
             if [ -f "$f" ]; then existing="$existing $f"; fi
