@@ -51,6 +51,19 @@ except ImportError:
 # 確認できたため、対象銘柄をBTCUSDTのみに絞っています。
 SYMBOLS = ["BTCUSDT"]
 
+# moonshot_analysis.py での検証の結果、BTCUSDT以外の29銘柄では「3日以内に
+# 高値ベースで+30%以上」という急騰の予兆として、「出来高急増+ゴールデンクロス」
+# の組み合わせにベースライン比+3.18pt（到達率6.25%、n=736、23/29銘柄に分散）の
+# エッジが確認できたため、この29銘柄を対象に別系統の「急騰予兆」通知を行う。
+MOONSHOT_SYMBOLS = [
+    "ETHUSDT", "BNBUSDT", "LTCUSDT", "ADAUSDT", "XRPUSDT",
+    "XLMUSDT", "TRXUSDT", "ETCUSDT", "LINKUSDT", "ENJUSDT",
+    "ATOMUSDT", "DOGEUSDT", "CHZUSDT", "BCHUSDT", "MANAUSDT",
+    "SOLUSDT", "SANDUSDT", "DOTUSDT", "UNIUSDT", "AVAXUSDT",
+    "NEARUSDT", "FILUSDT", "AAVEUSDT", "AXSUSDT", "SHIBUSDT",
+    "OPUSDT", "APTUSDT", "ARBUSDT", "SUIUSDT",
+]
+
 INTERVAL = "1h"            # ローソク足の間隔
 LOOKBACK_BARS = 500         # 取得本数（Binanceの上限は1000）
 INTERVAL_HOURS = {"1h": 1, "4h": 4, "1d": 24}.get(INTERVAL, 1)
@@ -89,14 +102,28 @@ NOTIFY_MAX_HOLD_DAYS = float(os.environ.get("NOTIFY_MAX_HOLD_DAYS", "60"))
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
+# --- 急騰予兆（ムーンショット）通知設定 ---
+# moonshot_analysis.py の検証結果に基づく通知条件。「出来高急増 かつ
+# ゴールデンクロス」を基本条件とし（n=736, 到達率6.25%, edge+3.18pt,
+# 23/29銘柄に分散）、そこにさらにRSI反発も重なった場合は本文で「高確度」と
+# 明記する（n=44, 到達率18.18%, edge+15.11pt。ただし発生回数が少なく参考程度）。
+MOONSHOT_REQUIRE_VOLUME_SPIKE = os.environ.get("MOONSHOT_REQUIRE_VOLUME_SPIKE", "1") != "0"
+MOONSHOT_REQUIRE_GOLDEN_CROSS = os.environ.get("MOONSHOT_REQUIRE_GOLDEN_CROSS", "1") != "0"
+# 「3日以内に+30%」の予兆シグナルという検証の枠組みに合わせたトラッキング設定
+MOONSHOT_TAKE_PROFIT_PCT = float(os.environ.get("MOONSHOT_TAKE_PROFIT_PCT", "30.0"))
+MOONSHOT_MAX_HOLD_DAYS = float(os.environ.get("MOONSHOT_MAX_HOLD_DAYS", "3.0"))
+
 STATE_FILE = "alert_state.json"
 RESULT_CSV = "signals_result.csv"
+MOONSHOT_RESULT_CSV = "moonshot_signals_result.csv"
 BACKTEST_CSV = "backtest_report.csv"
 ALERTS_LOG_CSV = "alerts_log.csv"
 ACCURACY_CSV = "accuracy_report.csv"
 SIGNAL_ACCURACY_CSV = "signal_accuracy.csv"
 NOTIFY_PERFORMANCE_CSV = "notify_performance_log.csv"
 NOTIFY_PERFORMANCE_REPORT_MD = "notify_performance_report.md"
+MOONSHOT_PERFORMANCE_CSV = "moonshot_performance_log.csv"
+MOONSHOT_PERFORMANCE_REPORT_MD = "moonshot_performance_report.md"
 
 ALERTS_LOG_COLUMNS = [
     "id", "symbol", "signal_at_utc", "score",
@@ -408,10 +435,10 @@ def print_signal_accuracy_report(resolved: pd.DataFrame):
 # 到達したかどうかを追跡する）
 # ============================================================
 
-def load_notify_performance_log() -> pd.DataFrame:
-    if os.path.exists(NOTIFY_PERFORMANCE_CSV):
+def load_notify_performance_log(csv_path: str = NOTIFY_PERFORMANCE_CSV) -> pd.DataFrame:
+    if os.path.exists(csv_path):
         try:
-            df = pd.read_csv(NOTIFY_PERFORMANCE_CSV)
+            df = pd.read_csv(csv_path)
             # 未決着行が全てNaNの列があると、pandasがfloat64型と推論してしまい、
             # 後で .at[] で文字列やTrue/Falseを代入する際に型エラーになるため、
             # 読み込み直後に全列をobject型へ固定しておく
@@ -430,29 +457,38 @@ def load_notify_performance_log() -> pd.DataFrame:
                     df[col] = None
             return df[NOTIFY_PERFORMANCE_COLUMNS]
         except Exception as e:
-            print(f"{NOTIFY_PERFORMANCE_CSV} の読み込みに失敗: {e}")
+            print(f"{csv_path} の読み込みに失敗: {e}")
     return pd.DataFrame(columns=NOTIFY_PERFORMANCE_COLUMNS)
 
 
-def save_notify_performance_log(df: pd.DataFrame):
-    df.to_csv(NOTIFY_PERFORMANCE_CSV, index=False, encoding="utf-8-sig")
+def save_notify_performance_log(df: pd.DataFrame, csv_path: str = NOTIFY_PERFORMANCE_CSV):
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
 
-def append_notify_performance(log: pd.DataFrame, symbol: str, notified_at, entry_price: float) -> pd.DataFrame:
+def append_notify_performance(
+    log: pd.DataFrame, symbol: str, notified_at, entry_price: float,
+    target_pct: float = None, max_hold_days: float = None,
+) -> pd.DataFrame:
+    # デフォルト引数をdef時点の値に固定してしまうと、実行時にNOTIFY_TAKE_PROFIT_PCT等を
+    # 上書きしても反映されなくなるため、Noneセンチネルにして呼び出し時に解決する
+    if target_pct is None:
+        target_pct = NOTIFY_TAKE_PROFIT_PCT
+    if max_hold_days is None:
+        max_hold_days = NOTIFY_MAX_HOLD_DAYS
     entry_id = f"{symbol}-{int(pd.Timestamp(notified_at).timestamp())}"
     if len(log) and (log["id"] == entry_id).any():
         return log
     if entry_price is None or entry_price <= 0:
         return log
-    target_price = entry_price * (1 + NOTIFY_TAKE_PROFIT_PCT / 100)
-    max_hold_until = pd.Timestamp(notified_at) + pd.Timedelta(days=NOTIFY_MAX_HOLD_DAYS)
+    target_price = entry_price * (1 + target_pct / 100)
+    max_hold_until = pd.Timestamp(notified_at) + pd.Timedelta(days=max_hold_days)
     new_row = {
         "id": entry_id,
         "symbol": symbol,
         "notified_at_utc": str(notified_at),
         "entry_price": entry_price,
         "target_price": round(target_price, 8),
-        "target_pct": NOTIFY_TAKE_PROFIT_PCT,
+        "target_pct": target_pct,
         "max_hold_until_utc": str(max_hold_until),
         "resolved": False,
         "resolved_at_utc": None,
@@ -522,9 +558,13 @@ def resolve_notify_performance_for_symbol(log: pd.DataFrame, symbol: str, price_
     return log
 
 
-def print_notify_performance_report(log: pd.DataFrame):
+def print_notify_performance_report(
+    log: pd.DataFrame, take_profit_pct: float = None, label: str = "本番成績",
+):
+    if take_profit_pct is None:
+        take_profit_pct = NOTIFY_TAKE_PROFIT_PCT
     print("\n" + "=" * 70)
-    print(f"■ 本番成績（実際に通知した銘柄が+{NOTIFY_TAKE_PROFIT_PCT:g}%まで到達したか）")
+    print(f"■ {label}（実際に通知した銘柄が+{take_profit_pct:g}%まで到達したか）")
     print("=" * 70)
     if len(log) == 0:
         print("まだ通知の記録がありません。")
@@ -549,19 +589,30 @@ def print_notify_performance_report(log: pd.DataFrame):
               f"決済={r['resolved_at_utc']} リターン={r['outcome_pct']:+.2f}%")
 
 
-def generate_notify_performance_report(log: pd.DataFrame):
+def generate_notify_performance_report(
+    log: pd.DataFrame,
+    take_profit_pct: float = None,
+    max_hold_days: float = None,
+    report_path: str = None,
+    title: str = "本番成績レポート",
+):
     """本番成績をGitHub上で読みやすいMarkdownレポートとして書き出す。
-    実行のたびに notify_performance_log.csv の最新状態から作り直すため、
-    常に最新の集計結果を反映する。
+    実行のたびにCSVの最新状態から作り直すため、常に最新の集計結果を反映する。
     """
+    if take_profit_pct is None:
+        take_profit_pct = NOTIFY_TAKE_PROFIT_PCT
+    if max_hold_days is None:
+        max_hold_days = NOTIFY_MAX_HOLD_DAYS
+    if report_path is None:
+        report_path = NOTIFY_PERFORMANCE_REPORT_MD
     lines = []
-    lines.append("# 本番成績レポート")
+    lines.append(f"# {title}")
     lines.append("")
     lines.append(f"最終更新(UTC): {datetime.now(timezone.utc).isoformat()}")
     lines.append("")
     lines.append(
-        f"実際にスマホへ通知した銘柄が、その後 **+{NOTIFY_TAKE_PROFIT_PCT:g}%**（利確目標）まで"
-        f"到達したか、それとも **{NOTIFY_MAX_HOLD_DAYS:g}日** 以内に到達できず期限切れ決済に"
+        f"実際にスマホへ通知した銘柄が、その後 **+{take_profit_pct:g}%**（利確目標）まで"
+        f"到達したか、それとも **{max_hold_days:g}日** 以内に到達できず期限切れ決済に"
         f"なったかをまとめたものです。"
     )
     lines.append("")
@@ -570,7 +621,7 @@ def generate_notify_performance_report(log: pd.DataFrame):
 
     if len(log) == 0:
         lines.append("まだ通知の記録がありません。")
-        _write_report_md(lines)
+        _write_report_md(lines, report_path)
         return
 
     resolved = log[log["resolved"] == True].copy()  # noqa: E712
@@ -609,11 +660,11 @@ def generate_notify_performance_report(log: pd.DataFrame):
     if len(pending) > 0:
         lines.append("## 保有中（決着待ち）")
         lines.append("")
-        lines.append("| 銘柄 | 通知時刻(UTC) | エントリー価格 | 目標価格(+{:g}%) |".format(NOTIFY_TAKE_PROFIT_PCT))
+        lines.append("| 銘柄 | 通知時刻(UTC) | エントリー価格 | 目標価格(+{:g}%) |".format(take_profit_pct))
         lines.append("|---|---|---|---|")
         for _, r in pending.sort_values("notified_at_utc", ascending=False).iterrows():
             lines.append(
-                f"| {r['symbol']} | {r['notified_at_utc']} | {r['entry_price']:,.2f} | {r['target_price']:,.2f} |"
+                f"| {r['symbol']} | {r['notified_at_utc']} | {r['entry_price']:,.6g} | {r['target_price']:,.6g} |"
             )
         lines.append("")
 
@@ -630,11 +681,11 @@ def generate_notify_performance_report(log: pd.DataFrame):
             )
         lines.append("")
 
-    _write_report_md(lines)
+    _write_report_md(lines, report_path)
 
 
-def _write_report_md(lines: list):
-    with open(NOTIFY_PERFORMANCE_REPORT_MD, "w", encoding="utf-8") as f:
+def _write_report_md(lines: list, report_path: str = NOTIFY_PERFORMANCE_REPORT_MD):
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
 
@@ -643,27 +694,30 @@ def _write_report_md(lines: list):
 # ============================================================
 
 def load_state() -> dict:
-    default = {"notify_active": [], "log_active": []}
+    default = {"notify_active": [], "log_active": [], "moonshot_notify_active": []}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):  # 旧バージョンとの互換
-                return {"notify_active": data, "log_active": []}
+                return {"notify_active": data, "log_active": [], "moonshot_notify_active": []}
             return {
                 "notify_active": data.get("notify_active", []),
                 "log_active": data.get("log_active", []),
+                # 旧バージョン（このキーが無いファイル）との互換のため既定値を空リストにする
+                "moonshot_notify_active": data.get("moonshot_notify_active", []),
             }
         except Exception:
             return default
     return default
 
 
-def save_state(notify_active: set, log_active: set):
+def save_state(notify_active: set, log_active: set, moonshot_notify_active: set = frozenset()):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump({
             "notify_active": sorted(notify_active),
             "log_active": sorted(log_active),
+            "moonshot_notify_active": sorted(moonshot_notify_active),
         }, f, ensure_ascii=False)
 
 
@@ -711,9 +765,10 @@ def send_notification(new_alerts: set, latest_rows: dict):
         print(f"通知送信に失敗しました: {e}")
 
 
-def send_exit_notification(newly_resolved: pd.DataFrame):
+def send_exit_notification(newly_resolved: pd.DataFrame, notification_kind: str = "signal"):
     """本番成績トラッキングで新たに決着（利確到達 or 期限切れ決済）した通知について、
-    結果をスマホへプッシュ通知する。
+    結果をスマホへプッシュ通知する。notification_kind="moonshot" の場合は、
+    急騰予兆（ムーンショット）系の決済であることが分かるタイトルにする。
     """
     if not NTFY_TOPIC:
         print("NTFY_TOPIC が未設定のため決済通知をスキップしました。")
@@ -728,13 +783,17 @@ def send_exit_notification(newly_resolved: pd.DataFrame):
         result_label = "利確ライン到達" if hit else "保有期限切れで決済"
         mark = "🎯" if hit else "⏱"
         lines = [f"{mark} {r['symbol']} {result_label}"]
-        lines.append(f"エントリー価格: {float(r['entry_price']):,.2f} USDT")
-        lines.append(f"決済価格: {float(r['exit_price']):,.2f} USDT")
+        # SHIBUSDTのような超低価格銘柄でも0.0000にならないよう、有効桁数ベースで整形する
+        lines.append(f"エントリー価格: {float(r['entry_price']):,.6g} USDT")
+        lines.append(f"決済価格: {float(r['exit_price']):,.6g} USDT")
         lines.append(f"リターン: {float(r['outcome_pct']):+.2f}%")
         lines.append(f"保有日数: {float(r['days_held']):.1f}日")
         blocks.append("\n".join(lines))
     body = "\n\n".join(blocks) + "\n\n※投資助言ではありません。実際の売買・利確はご自身の判断で行ってください。"
-    title = "Crypto Signal Exit" if any_hit else "Crypto Signal Update"
+    if notification_kind == "moonshot":
+        title = "Crypto Moonshot Exit" if any_hit else "Crypto Moonshot Update"
+    else:
+        title = "Crypto Signal Exit" if any_hit else "Crypto Signal Update"
     try:
         requests.post(
             f"{NTFY_SERVER}/{NTFY_TOPIC}",
@@ -751,6 +810,79 @@ def send_exit_notification(newly_resolved: pd.DataFrame):
         print(f"決済通知の送信に失敗しました: {e}")
 
 
+def send_moonshot_notification(new_alerts: set, latest_rows: dict):
+    """BTCUSDT以外の29銘柄向け「急騰予兆」通知。moonshot_analysis.py の検証結果
+    （出来高急増+ゴールデンクロス: 3日以内+30%到達率6.25%・edge+3.18pt、
+    　+RSI反発も重なると到達率18.18%・edge+15.11pt）に基づく。
+    BTCの通常シグナル（勝率79〜87%クラス）とは性質が全く異なる、低確率・
+    高倍率の「予兆」であることを本文で必ず明記する。
+    """
+    if not NTFY_TOPIC:
+        print("NTFY_TOPIC が未設定のため急騰予兆通知をスキップしました。")
+        return
+    blocks = []
+    for sym in sorted(new_alerts):
+        r = latest_rows.get(sym, {})
+        price = r.get("price")
+        vr = r.get("volume_ratio")
+        rsi = r.get("rsi")
+        high_confidence = bool(r.get("high_confidence"))
+        tag = "🚀 高確度（過去実績: 到達率約18%）" if high_confidence else "🚀 通常（過去実績: 到達率約6%）"
+        lines = [f"{sym} 急騰予兆シグナル発生", tag]
+        if price is not None:
+            lines.append(f"現在価格: {price:,.6g} USDT")
+        if vr is not None:
+            lines.append(f"出来高: 平均の{vr}倍")
+        if rsi is not None:
+            lines.append(f"RSI: {rsi}")
+        blocks.append("\n".join(lines))
+    body = (
+        "\n\n".join(blocks)
+        + f"\n\n※これは「3日以内に+{MOONSHOT_TAKE_PROFIT_PCT:g}%以上」到達した過去のケースを"
+        + "遡って調べた際の予兆パターンです。過去データ上の到達率は数%〜20%程度と低く、"
+        + "外れる（到達しない）方が多い点に注意してください。投資助言ではありません。"
+        + "売買判断はご自身で行ってください。"
+    )
+    try:
+        requests.post(
+            f"{NTFY_SERVER}/{NTFY_TOPIC}",
+            data=body.encode("utf-8"),
+            headers={
+                "Title": "Crypto Moonshot Alert",
+                "Priority": "default",
+                "Tags": "rocket",
+            },
+            timeout=10,
+        )
+        print(f"急騰予兆通知を送信しました: {', '.join(sorted(new_alerts))}")
+    except Exception as e:
+        print(f"急騰予兆通知の送信に失敗しました: {e}")
+
+
+def compute_latest_row(df: pd.DataFrame, sig: pd.DataFrame) -> dict:
+    """直近バーのシグナル状態を辞書にまとめる（BTC・ムーンショット両ループで共用）。"""
+    last = sig.iloc[-1]
+    price = float(df["close"].iloc[-1])
+    bars_24h = 24 if INTERVAL == "1h" else 1
+    pct24 = None
+    if len(df) > bars_24h:
+        past_price = float(df["close"].iloc[-bars_24h - 1])
+        if past_price > 0:
+            pct24 = round((price - past_price) / past_price * 100, 2)
+    return {
+        "score": int(last["score"]),
+        "price": price,
+        "pct_change_24h_bars": pct24,
+        "volume_spike": bool(last["volume_spike"]),
+        "volume_ratio": round(float(last["volume_ratio"]), 2) if pd.notna(last["volume_ratio"]) else None,
+        "bb_squeeze": bool(last["bb_squeeze"]),
+        "bandwidth_pct": round(float(last["bandwidth_pct"]), 2) if pd.notna(last["bandwidth_pct"]) else None,
+        "golden_cross": bool(last["golden_cross"]),
+        "rsi": round(float(last["rsi"]), 1) if pd.notna(last["rsi"]) else None,
+        "rsi_rebound": bool(last["rsi_rebound"]),
+    }
+
+
 # ============================================================
 # メイン処理
 # ============================================================
@@ -763,6 +895,7 @@ def main():
     prev_state = load_state()
     prev_notify_active = set(prev_state["notify_active"])
     prev_log_active = set(prev_state["log_active"])
+    prev_moonshot_active = set(prev_state["moonshot_notify_active"])
 
     alerts_log = load_alerts_log()
     notify_perf_log = load_notify_performance_log()
@@ -784,27 +917,7 @@ def main():
             sig = compute_signal_series(df)
             all_backtest_rows.extend(backtest_rows(sig))
 
-            last = sig.iloc[-1]
-            price = float(df["close"].iloc[-1])
-            bars_24h = 24 if INTERVAL == "1h" else 1
-            pct24 = None
-            if len(df) > bars_24h:
-                past_price = float(df["close"].iloc[-bars_24h - 1])
-                if past_price > 0:
-                    pct24 = round((price - past_price) / past_price * 100, 2)
-
-            row = {
-                "score": int(last["score"]),
-                "price": price,
-                "pct_change_24h_bars": pct24,
-                "volume_spike": bool(last["volume_spike"]),
-                "volume_ratio": round(float(last["volume_ratio"]), 2) if pd.notna(last["volume_ratio"]) else None,
-                "bb_squeeze": bool(last["bb_squeeze"]),
-                "bandwidth_pct": round(float(last["bandwidth_pct"]), 2) if pd.notna(last["bandwidth_pct"]) else None,
-                "golden_cross": bool(last["golden_cross"]),
-                "rsi": round(float(last["rsi"]), 1) if pd.notna(last["rsi"]) else None,
-                "rsi_rebound": bool(last["rsi_rebound"]),
-            }
+            row = compute_latest_row(df, sig)
             latest_rows[symbol] = row
 
             notify_condition = True
@@ -900,9 +1013,95 @@ def main():
         print(f"\n決済（決着）した通知: {', '.join(sorted(newly_resolved_df['symbol'].tolist()))}")
         send_exit_notification(newly_resolved_df)
 
-    save_state(new_notify_active, new_log_active)
+    # ============================================================
+    # 急騰予兆（ムーンショット）: BTCUSDT以外29銘柄
+    # moonshot_analysis.py の検証結果に基づく別系統の通知・成績トラッキング。
+    # BTCのライブ運用（上記）とは完全に独立して動く。
+    # ============================================================
+    print("\n" + "=" * 70)
+    print(f"■ 急騰予兆スクリーニング（BTCUSDT以外 {len(MOONSHOT_SYMBOLS)}銘柄）")
+    print("=" * 70)
 
-    print(f"\n結果を {RESULT_CSV} に保存しました。")
+    moonshot_perf_log = load_notify_performance_log(MOONSHOT_PERFORMANCE_CSV)
+    moonshot_latest_rows = {}
+    new_moonshot_active = set()
+    newly_resolved_moonshot_rows = []
+
+    for i, symbol in enumerate(MOONSHOT_SYMBOLS, 1):
+        try:
+            df = fetch_klines(symbol, INTERVAL, LOOKBACK_BARS)
+            min_needed = max(BB_WINDOW, MA_LONG, RSI_WINDOW, 60) + HORIZON_BARS + 5
+            if len(df) < min_needed:
+                print(f"[{i}/{len(MOONSHOT_SYMBOLS)}] {symbol}: データ不足のためスキップ")
+                continue
+
+            sig = compute_signal_series(df)
+            row = compute_latest_row(df, sig)
+            row["high_confidence"] = row["rsi_rebound"]  # 3シグナル重複＝過去実績で到達率が上がる組み合わせ
+            moonshot_latest_rows[symbol] = row
+
+            moonshot_condition = True
+            if MOONSHOT_REQUIRE_VOLUME_SPIKE:
+                moonshot_condition = moonshot_condition and row["volume_spike"]
+            if MOONSHOT_REQUIRE_GOLDEN_CROSS:
+                moonshot_condition = moonshot_condition and row["golden_cross"]
+            if moonshot_condition:
+                new_moonshot_active.add(symbol)
+
+            before_ids = set(
+                moonshot_perf_log[
+                    (moonshot_perf_log["symbol"] == symbol) & (moonshot_perf_log["resolved"] != True)  # noqa: E712
+                ]["id"]
+            )
+            moonshot_perf_log = resolve_notify_performance_for_symbol(moonshot_perf_log, symbol, df)
+            if before_ids:
+                newly_resolved_mask = moonshot_perf_log["id"].isin(before_ids) & (moonshot_perf_log["resolved"] == True)  # noqa: E712
+                if newly_resolved_mask.any():
+                    newly_resolved_moonshot_rows.append(moonshot_perf_log[newly_resolved_mask].copy())
+
+            print(f"[{i}/{len(MOONSHOT_SYMBOLS)}] {symbol:10s} score={row['score']}"
+                  f"{'  ★急騰予兆条件成立' if moonshot_condition else ''}")
+        except Exception as e:
+            print(f"[{i}/{len(MOONSHOT_SYMBOLS)}] {symbol}: エラー ({e})")
+        time.sleep(0.15)
+
+    if moonshot_latest_rows:
+        moonshot_df_res = pd.DataFrame([{"symbol": s, **v} for s, v in moonshot_latest_rows.items()])
+        moonshot_df_res = moonshot_df_res.sort_values(["score", "volume_ratio"], ascending=[False, False])
+        moonshot_df_res.to_csv(MOONSHOT_RESULT_CSV, index=False, encoding="utf-8-sig")
+
+    truly_new_moonshot = new_moonshot_active - prev_moonshot_active
+    if truly_new_moonshot:
+        print(f"\n急騰予兆の新規アラート: {', '.join(sorted(truly_new_moonshot))}")
+        send_moonshot_notification(truly_new_moonshot, moonshot_latest_rows)
+        now_utc = datetime.now(timezone.utc)
+        for sym in truly_new_moonshot:
+            r = moonshot_latest_rows.get(sym, {})
+            moonshot_perf_log = append_notify_performance(
+                moonshot_perf_log, sym, now_utc, r.get("price"),
+                target_pct=MOONSHOT_TAKE_PROFIT_PCT, max_hold_days=MOONSHOT_MAX_HOLD_DAYS,
+            )
+    else:
+        print("\n急騰予兆の新規アラートなし")
+
+    save_notify_performance_log(moonshot_perf_log, MOONSHOT_PERFORMANCE_CSV)
+    print_notify_performance_report(moonshot_perf_log, take_profit_pct=MOONSHOT_TAKE_PROFIT_PCT, label="急騰予兆成績")
+    generate_notify_performance_report(
+        moonshot_perf_log,
+        take_profit_pct=MOONSHOT_TAKE_PROFIT_PCT,
+        max_hold_days=MOONSHOT_MAX_HOLD_DAYS,
+        report_path=MOONSHOT_PERFORMANCE_REPORT_MD,
+        title="急騰予兆（ムーンショット）成績レポート",
+    )
+
+    if newly_resolved_moonshot_rows:
+        newly_resolved_moonshot_df = pd.concat(newly_resolved_moonshot_rows, ignore_index=True)
+        print(f"\n急騰予兆の決済（決着）: {', '.join(sorted(newly_resolved_moonshot_df['symbol'].tolist()))}")
+        send_exit_notification(newly_resolved_moonshot_df, notification_kind="moonshot")
+
+    save_state(new_notify_active, new_log_active, new_moonshot_active)
+
+    print(f"\n結果を {RESULT_CSV} / {MOONSHOT_RESULT_CSV} に保存しました。")
     print("※ 過去パターンとの一致・過去の実績を示すものであり、将来の値動きを保証するものではありません。")
 
 
