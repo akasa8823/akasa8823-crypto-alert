@@ -81,11 +81,15 @@ HOLD_DAYS = float(os.environ.get("MOONSHOT_HOLD_DAYS", "3"))
 HORIZON_BARS = int(round(BARS_PER_DAY * HOLD_DAYS))
 SUCCESS_THRESHOLD_PCT = float(os.environ.get("MOONSHOT_SUCCESS_THRESHOLD_PCT", "30.0"))
 
-BY_SCORE_CSV = "moonshot_by_score.csv"
-BY_COMBO_CSV = "moonshot_by_combo.csv"
-BY_SYMBOL_CSV = "moonshot_by_symbol.csv"
-COVERAGE_CSV = "moonshot_coverage.csv"
-REPORT_MD = "moonshot_report.md"
+# 閾値（+30%/+10%など）を変えて再実行しても、前回の出力ファイルを上書きしない
+# ようにするための出力ファイル名プレフィックス（notify_simulation_matrix.py の
+# MATRIX_OUTPUT_PREFIX と同じ考え方）
+_OUTPUT_PREFIX = os.environ.get("MOONSHOT_OUTPUT_PREFIX", "moonshot")
+BY_SCORE_CSV = f"{_OUTPUT_PREFIX}_by_score.csv"
+BY_COMBO_CSV = f"{_OUTPUT_PREFIX}_by_combo.csv"
+BY_SYMBOL_CSV = f"{_OUTPUT_PREFIX}_by_symbol.csv"
+COVERAGE_CSV = f"{_OUTPUT_PREFIX}_coverage.csv"
+REPORT_MD = f"{_OUTPUT_PREFIX}_report.md"
 
 # 組み合わせ集計で、この件数未満のものはノイズとして表から除外する
 MIN_COMBO_N = int(os.environ.get("MOONSHOT_MIN_COMBO_N", "30"))
@@ -270,7 +274,7 @@ def main():
 
     # --- Markdownレポート ---
     lines = []
-    lines.append("# 急騰予兆シグナル検証レポート（3日以内+30%以上到達）\n")
+    lines.append(f"# 急騰予兆シグナル検証レポート（{HOLD_DAYS:g}日以内+{SUCCESS_THRESHOLD_PCT:g}%以上到達）\n")
     lines.append(f"- 実行日時(UTC): {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"- 対象銘柄数: {len(MOONSHOT_SYMBOLS)}（BTCUSDTを除く。データ取得成功: {len(cov_df)}）")
     lines.append(f"- 使用した足: {DEEP_INTERVAL}（4時間足）")
@@ -331,7 +335,7 @@ def main():
         )
 
     lines.append("\n## 重要な注意事項\n")
-    lines.append("- 「3日以内に+30%以上」はかなり極端な値動きです。過去に実際に発生した回数（n）が")
+    lines.append(f"- 「{HOLD_DAYS:g}日以内に+{SUCCESS_THRESHOLD_PCT:g}%以上」という値動きです。過去に実際に発生した回数（n）が")
     lines.append("  少ない場合、その数字は偶然の産物である可能性が高く、再現性は保証されません。")
     lines.append("- 上の「銘柄別の内訳」で、到達が特定の1〜2銘柄に極端に偏っている場合、")
     lines.append("  それは「シグナルのエッジ」ではなく「その銘柄固有のイベント（上場・提携発表等）」")
