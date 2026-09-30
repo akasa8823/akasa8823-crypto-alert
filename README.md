@@ -51,6 +51,25 @@
   決着済み履歴の一覧表を含みます。GitHub上でこのファイルを開くと、成績の推移を
   一目で確認できます。
 
+### 急騰予兆（ムーンショット）通知：BTCUSDT以外29銘柄
+
+`moonshot_analysis.py` での検証結果に基づき、BTCUSDTのライブ運用（上記）とは
+完全に独立した、もう一系統の通知を追加しています。
+
+- 対象: BTCUSDTを除く29銘柄（`MOONSHOT_SYMBOLS`）
+- 通知条件: 「出来高急増 かつ ゴールデンクロス」が新規成立（`MOONSHOT_REQUIRE_VOLUME_SPIKE`
+  / `MOONSHOT_REQUIRE_GOLDEN_CROSS` で個別に無効化可）。検証結果は発生回数736件・
+  到達率6.25%（ベースライン比+3.18pt）・23/29銘柄に分散、というもの
+- そこに「RSI反発」も重なった場合は、通知本文で「高確度（過去実績: 到達率約18%）」
+  と明記する（ただし発生回数44件と少なく、こちらは参考程度）
+- **BTCの通常シグナル（勝率79〜87%クラス）とは全く性質が異なり、低確率・
+  高倍率の「予兆」です。過去データ上は当たらない方が多い点に必ず注意してください。**
+- `moonshot_signals_result.csv` — 毎回の実行時点での29銘柄の最新シグナル状況
+- `moonshot_performance_log.csv` / `moonshot_performance_report.md` — 通知した
+  銘柄がその後3日以内（`MOONSHOT_MAX_HOLD_DAYS`）に+30%（`MOONSHOT_TAKE_PROFIT_PCT`）
+  まで到達したかの成績トラッキング（BTCと同じ仕組みを流用）。決着時には
+  「Crypto Moonshot Exit / Update」のタイトルで決済通知も送信される
+
 ### 決済（利確到達／期限切れ）のプッシュ通知
 
 新規シグナル発生時の通知に加えて、`notify_performance_log.csv` に記録した保有中の
@@ -145,6 +164,53 @@
   「その銘柄固有のイベント」を拾っているだけの可能性が高い点に注意してください。
   実際にライブ運用（BTCUSDT以外の29銘柄向けの追加通知）へ組み込むかどうかは、
   このレポートの結果を見てから判断します。
+- `.github/workflows/moonshot_analysis_tp10.yml` — 同じ検証を、到達ラインを
+  +30%ではなく**+10%**に緩めて行う版（`MOONSHOT_SUCCESS_THRESHOLD_PCT=10.0`）。
+  的中率（到達率）を上げたい場合の比較用。出力は `moonshot_tp10_*` というファイル名
+  になり、+30%版の結果を上書きしない（`MOONSHOT_OUTPUT_PREFIX` で切り替え可能）。
+
+### 急騰予兆 複利シミュレーション（100万円を運用したら実際いくらになるか）
+
+- `moonshot_simulation.py` — `notify_simulation.py`（BTC用）と同じ考え方・同じ
+  関数（`fetch_klines_forward` / `compound_simulate`）を再利用し、BTCUSDT以外の
+  29銘柄について、急騰予兆のライブ通知条件（デフォルト: 出来高急増 かつ
+  ゴールデンクロス）が過去に成立するたびに、その時点の残高の一定割合
+  （デフォルト10%）を投資し、利確ライン（デフォルト+30%、3日以内）まで到達したら
+  利確する、という複利シミュレーションを行います。1日あたりの件数フィルタは
+  行わず、29銘柄ぶんの通知を全てプールして時系列順に実行します（4時間足を使用、
+  `moonshot_analysis.py` の検証と条件を揃えています）。
+- `.github/workflows/moonshot_simulation.yml` — ライブ運用と同じ**+30%**版
+  （Actionsタブ → "crypto-moonshot-simulation" → "Run workflow"）。
+- `.github/workflows/moonshot_simulation_tp10.yml` — 利確ラインを**+10%**に
+  緩めた版（`MOONSHOT_SIM_TAKE_PROFIT_PCT=10.0`）。「10%運用なら100万円が
+  いくらになるか」を確認したい場合はこちらを実行してください。出力ファイル名は
+  `moonshot_simulation_tp10_*` になり、+30%版の結果を上書きしません。
+- `.github/workflows/moonshot_simulation_rsi10.yml` — 通知条件をゴールデンクロス
+  ではなく、**BTC本体と同じ「出来高急増＋RSI反発」**に変更し、利確ラインは+10%で
+  検証する版（`MOONSHOT_SIM_REQUIRE_GOLDEN_CROSS=0` / `MOONSHOT_SIM_REQUIRE_RSI_REBOUND=1`）。
+  `moonshot_analysis.py` の+10%版検証でこの組み合わせが最も統計的に頑丈な
+  エッジ（n=3,167、全29銘柄に分散、到達率約30.85%）だった一方、通知頻度が
+  システム全体で1日1回以上とかなり高いため、実際に資金を投じた場合の複利成績・
+  最大ドローダウンをこちらで確認できます。出力ファイル名は `moonshot_simulation_rsi10_*`。
+  いずれも29銘柄ぶんの長期データを取得するため、1〜2時間程度かかることがあります。
+- 出力: `moonshot_simulation_trades.csv`（個別トレードの明細）、
+  `moonshot_simulation_report.md`（複利シミュレーション結果・年別内訳・
+  最大ドローダウンを含むレポート本体）。tp10版・rsi10版もそれぞれ同じ命名規則
+  （`<prefix>_trades.csv` / `<prefix>_report.md`）で出力されます。
+- 注意事項（`notify_simulation.py` と同様）: 過去データの機械的な再現であり将来を
+  保証しない、同時に複数銘柄で通知が重なった場合の必要資金は考慮していない、
+  複利かつ1回ごとに残高の一定割合を投じるため連敗時のドローダウンが大きくなる
+  リスクがある（レポート内の最大ドローダウンを必ず確認）、スリッページ未考慮、
+  手数料は往復0.2%の概算、投資助言ではない。
+- 調整可能な環境変数: `MOONSHOT_SIM_START_DATE`（データ取得開始日）、
+  `MOONSHOT_SIM_TAKE_PROFIT_PCT` / `MOONSHOT_SIM_MAX_HOLD_DAYS`（利確ライン・
+  最大保有日数、デフォルトはライブ運用の `MOONSHOT_TAKE_PROFIT_PCT` /
+  `MOONSHOT_MAX_HOLD_DAYS` と同じ）、`MOONSHOT_SIM_REQUIRE_VOLUME_SPIKE` /
+  `MOONSHOT_SIM_REQUIRE_GOLDEN_CROSS` / `MOONSHOT_SIM_REQUIRE_RSI_REBOUND`
+  （通知条件。RSI反発はデフォルトOFF）、`MOONSHOT_SIM_FEE_ROUNDTRIP_PCT`
+  （往復手数料の概算）、`MOONSHOT_SIM_INITIAL_CAPITAL_JPY`（元本、デフォルト100万円）、
+  `MOONSHOT_SIM_ENTRY_FRACTION`（1回のエントリーで投資する残高の割合、
+  デフォルト0.10＝10%）、`MOONSHOT_SIM_OUTPUT_PREFIX`（出力ファイル名の接頭辞）。
 
 ## 設定の変更
 
@@ -152,5 +218,7 @@
   `NOTIFY_REQUIRE_RSI_REBOUND`（デフォルトはどちらも有効=両方成立で通知。
   環境変数で `"0"` にすると個別に無効化できます）
 - 実行頻度: `.github/workflows/screener.yml` の `cron`（UTC基準）
-- 対象銘柄: `crypto_signal_screener.py` の `SYMBOLS`（現在はBTCUSDTのみ）
+- 対象銘柄: `crypto_signal_screener.py` の `SYMBOLS`（BTC本体、現在はBTCUSDTのみ）／
+  `MOONSHOT_SYMBOLS`（急騰予兆の対象29銘柄）
+- 急騰予兆の通知条件: `MOONSHOT_REQUIRE_VOLUME_SPIKE` / `MOONSHOT_REQUIRE_GOLDEN_CROSS`
 - 各シグナルのしきい値: `crypto_signal_screener.py` 冒頭のパラメータ
