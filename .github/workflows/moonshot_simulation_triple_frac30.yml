@@ -1,0 +1,57 @@
+name: crypto-moonshot-simulation-triple-frac30
+
+on:
+  workflow_dispatch: {}   # 手動実行専用（Actionsタブから "Run workflow" で実行してください）
+
+permissions:
+  contents: write
+
+jobs:
+  moonshot-simulation-triple-frac30:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run moonshot compounding simulation (3条件AND・投入割合30%版)
+        env:
+          MOONSHOT_SIM_REQUIRE_RSI_REBOUND: "1"
+          MOONSHOT_SIM_ENTRY_FRACTION: "0.30"
+          MOONSHOT_SIM_OUTPUT_PREFIX: "moonshot_simulation_triple_frac30"
+        run: python moonshot_simulation.py
+
+      - name: Commit report
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          files="moonshot_simulation_triple_frac30_trades.csv moonshot_simulation_triple_frac30_report.md"
+          existing=""
+          for f in $files; do
+            if [ -f "$f" ]; then existing="$existing $f"; fi
+          done
+          if [ -z "$existing" ]; then
+            echo "no files to commit"
+            exit 0
+          fi
+          git add $existing
+          if git diff --staged --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git commit -m "update moonshot compounding simulation report (triple combo, entry fraction 30%) [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "push failed, retrying ($i)..."
+            sleep $((RANDOM % 10 + 5))
+          done
+          echo "push failed after retries"
+          exit 1
