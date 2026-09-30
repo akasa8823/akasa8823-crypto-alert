@@ -24,6 +24,11 @@ BTCUSDT以外の29銘柄（MOONSHOT_SYMBOLS）について、ライブ運用の�
   以後の高値（high）を順に見て、最初に到達した時点で利確したとみなします。
 - 利確ラインに到達しないまま MOONSHOT_SIM_MAX_HOLD_DAYS（デフォルト3日）が
   経過したら、その時点の終値で強制決済したものとして扱います。
+- 通知条件は環境変数で個別にON/OFFできます：MOONSHOT_SIM_REQUIRE_VOLUME_SPIKE
+  （デフォルトON）、MOONSHOT_SIM_REQUIRE_GOLDEN_CROSS（デフォルトON＝ライブ運用と
+  同じ）、MOONSHOT_SIM_REQUIRE_RSI_REBOUND（デフォルトOFF。BTC本体と同じ
+  「出来高急増＋RSI反発」の組み合わせを検証したい場合はこちらをONにし、
+  GOLDEN_CROSSをOFFにしてください）。
 - 全29銘柄のトレードを時系列順にプール（1日あたりの件数フィルタは行わない。
   ライブ運用の急騰予兆通知自体が日次フィルタを行っていないため）し、毎回
   「その時点の残高の MOONSHOT_SIM_ENTRY_FRACTION 割合」を投資する複利計算。
@@ -69,6 +74,11 @@ PAGE_SLEEP_SEC = 0.15
 
 REQUIRE_VOLUME_SPIKE = os.environ.get("MOONSHOT_SIM_REQUIRE_VOLUME_SPIKE", "1") != "0"
 REQUIRE_GOLDEN_CROSS = os.environ.get("MOONSHOT_SIM_REQUIRE_GOLDEN_CROSS", "1") != "0"
+# BTC本体と同じ「出来高急増 かつ RSI反発」の組み合わせを検証したい場合に有効化する
+# （デフォルトはライブ運用の急騰予兆条件と同じくOFF。moonshot_analysis.py の
+# +10%版検証で "出来高急増+RSI反発" のエッジが最も頑丈だった組み合わせを
+# 実際のお金で複利シミュレーションしたい場合に使用）
+REQUIRE_RSI_REBOUND = os.environ.get("MOONSHOT_SIM_REQUIRE_RSI_REBOUND", "0") != "0"
 
 TAKE_PROFIT_PCT = float(os.environ.get("MOONSHOT_SIM_TAKE_PROFIT_PCT", str(core.MOONSHOT_TAKE_PROFIT_PCT)))
 MAX_HOLD_DAYS = float(os.environ.get("MOONSHOT_SIM_MAX_HOLD_DAYS", str(core.MOONSHOT_MAX_HOLD_DAYS)))
@@ -97,11 +107,14 @@ def simulate_symbol(symbol: str, df: pd.DataFrame) -> list:
 
     vs = sig["volume_spike"].to_numpy()
     gc = sig["golden_cross"].to_numpy()
+    rr = sig["rsi_rebound"].to_numpy()
     entry_signal = np.ones(n, dtype=bool)
     if REQUIRE_VOLUME_SPIKE:
         entry_signal &= vs
     if REQUIRE_GOLDEN_CROSS:
         entry_signal &= gc
+    if REQUIRE_RSI_REBOUND:
+        entry_signal &= rr
     volume_ratio = sig["volume_ratio"].to_numpy()
 
     open_time = df["open_time"].to_numpy()
@@ -163,6 +176,7 @@ def main():
     condition_label = " かつ ".join(
         ([] if not REQUIRE_VOLUME_SPIKE else ["出来高急増"])
         + ([] if not REQUIRE_GOLDEN_CROSS else ["ゴールデンクロス"])
+        + ([] if not REQUIRE_RSI_REBOUND else ["RSI反発"])
     ) or "（条件なし）"
 
     print(f"実行時刻(UTC): {datetime.now(timezone.utc).isoformat()}")
