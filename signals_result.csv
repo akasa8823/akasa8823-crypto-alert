@@ -1,2 +1,2 @@
 ﻿symbol,score,price,pct_change_24h_bars,volume_spike,volume_ratio,bb_squeeze,bandwidth_pct,golden_cross,rsi,rsi_rebound
-BTCUSDT,0,83949.6,-1.86,False,2.14,False,2.85,False,18.0,False
+BTCUSDT,1,83810.01,-2.02,True,3.37,False,2.95,False,17.3,False
