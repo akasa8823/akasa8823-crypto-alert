@@ -1,5 +1,5 @@
 ﻿signal,label,n,win_rate_pct,mean_return_pct
 volume_spike,出来高急増,11,0.0,-0.22
 bb_squeeze,ボラティリティ収縮,22,54.5,5.4
-golden_cross,ゴールデンクロス,11,36.4,1.49
+golden_cross,ゴールデンクロス,12,33.3,1.1
 rsi_rebound,RSI反発,109,58.7,4.27
