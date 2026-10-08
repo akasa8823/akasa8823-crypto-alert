@@ -1,1 +1,2 @@
 ﻿id,symbol,notified_at_utc,entry_price,target_price,target_pct,max_hold_until_utc,resolved,resolved_at_utc,exit_price,outcome_pct,hit,days_held
+BTCUSDT-1791474311,BTCUSDT,2026-10-08 15:45:11.444235+00:00,81275.04,89402.544,10.0,2026-12-07 15:45:11.444235+00:00,False,,,,,
